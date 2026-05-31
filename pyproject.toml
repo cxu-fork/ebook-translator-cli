@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ebook-translator"
+version = "0.1.0"
+description = "无头命令行批量电子书翻译工具"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "lxml>=5.0",
+    "tqdm>=4.60",
+]
+
+[project.scripts]
+ebook-translator = "ebook_translator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

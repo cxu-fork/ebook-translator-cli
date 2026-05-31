@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.DS_Store
+config.json
+.et_tmp/
+*.db
+*.db-shm
+*.db-wal
