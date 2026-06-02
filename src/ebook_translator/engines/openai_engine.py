@@ -78,6 +78,8 @@ class OpenAIEngine(TranslationEngine):
         content = msg.get("content", "")
         if not content:
             content = choices[0].get("text", "")
+        if not content:
+            raise RuntimeError(f"API 返回空译文: {json.dumps(data)[:500]}")
         return content.strip()
 
     def translate_stream(self, text: str, prompt: str = "") -> Generator[str, None, None]:

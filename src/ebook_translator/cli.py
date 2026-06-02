@@ -171,6 +171,8 @@ class TranslationWorker:
         for attempt in range(1, max_retries + 1):
             try:
                 result = self.engine.translate(text, prompt=prompt)
+                if not result or not result.strip():
+                    raise RuntimeError("API 返回空译文")
                 with self._abort_lock:
                     self.abort_count = 0
                 return result

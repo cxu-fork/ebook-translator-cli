@@ -70,7 +70,10 @@ class AnthropicEngine(TranslationEngine):
         content_blocks = data.get("content", [])
         if not content_blocks:
             raise RuntimeError(f"API 返回空结果: {json.dumps(data)[:500]}")
-        return content_blocks[0].get("text", "").strip()
+        text = content_blocks[0].get("text", "").strip()
+        if not text:
+            raise RuntimeError(f"API 返回空译文: {json.dumps(data)[:500]}")
+        return text
 
     def translate_stream(self, text: str, prompt: str = "") -> Generator[str, None, None]:
         prompt = self.build_prompt(prompt)
