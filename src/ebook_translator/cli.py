@@ -1,6 +1,10 @@
 """CLI 入口与翻译编排器。"""
 import argparse
 import asyncio
+import concurrent.futures
+import hashlib
+import json
+import logging
 import os
 import re
 import signal
@@ -41,6 +45,7 @@ def _c(text: str, *codes: str) -> str:
 def _err(msg, *pbars):
     """输出错误消息，兼容 tqdm 和非 tqdm 环境。"""
     line = _c(f"  ✗ {msg}", _RED)
+    logging.error(msg)
     for p in pbars:
         if p is not None:
             try:
@@ -49,6 +54,23 @@ def _err(msg, *pbars):
             except Exception:
                 pass
     print(line, file=sys.stderr)
+
+
+def _is_permanent_translation_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    needles = (
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "invalid_api_key",
+        "incorrect api key",
+        "api 密钥无效",
+        "密钥无效",
+        "已过期",
+    )
+    return any(needle in text for needle in needles)
 
 
 # 术语表
@@ -71,6 +93,7 @@ class Glossary:
             tgt = lines[1].strip() if len(lines) > 1 else src
             if src:
                 self.pairs.append((src, tgt))
+        self.pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
     def apply(self, text: str) -> str:
         for i, (src, _tgt) in enumerate(self.pairs):
@@ -79,9 +102,42 @@ class Glossary:
 
     def restore(self, text: str) -> str:
         for i, (_src, tgt) in enumerate(self.pairs):
-            token = f"{{{{id_{i:06d}}}}}"
-            text = text.replace(token, tgt)
+            pattern = r"\{\{\s*" + re.escape(f"id_{i:06d}") + r"\s*\}\}"
+            text = re.sub(pattern, lambda _m, value=tgt: value, text)
         return text
+
+
+def _file_md5(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _build_cache_key(input_path: str, elements: list, config: Config,
+                     glossary: Glossary) -> str:
+    engine_cfg = config.get_engine()
+    element_sig = md5(json.dumps(
+        [(el.uid, el.page_href, el.original) for el in elements],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ))
+    payload = {
+        "cache_version": 2,
+        "source_content_md5": _file_md5(input_path),
+        "element_signature": element_sig,
+        "engine": config.engine,
+        "source_lang": config.source_lang,
+        "target_lang": config.target_lang,
+        "prompt": config.prompt,
+        "model": engine_cfg.model,
+        "base_url": engine_cfg.base_url,
+        "merge_enabled": config.merge_enabled,
+        "merge_length": config.merge_length,
+        "glossary": glossary.pairs,
+    }
+    return md5(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 # ---------------------------------------------------------------------------
@@ -102,19 +158,25 @@ class TranslationWorker:
         self.glossary = glossary
         self.abort_count = 0
         self.progress_callback = progress_callback
+        import threading
+        self._abort_lock = threading.Lock()
 
-    def _translate_one(self, text: str) -> str:
+    def _translate_one(self, text: str, prompt: str | None = None) -> str:
         import random
         engine_cfg = self.config.get_engine()
         max_retries = engine_cfg.max_retries
         retry_delay = engine_cfg.retry_delay
+        prompt = prompt if prompt is not None else self.config.prompt
 
         for attempt in range(1, max_retries + 1):
             try:
-                result = self.engine.translate(text, prompt=self.config.prompt)
-                self.abort_count = 0
+                result = self.engine.translate(text, prompt=prompt)
+                with self._abort_lock:
+                    self.abort_count = 0
                 return result
             except Exception as e:
+                if _is_permanent_translation_error(e):
+                    raise
                 if attempt < max_retries:
                     # 429: 用更长的退避
                     err_str = str(e)
@@ -132,48 +194,167 @@ class TranslationWorker:
                 else:
                     raise
 
+    def _merge_groups(self, paragraphs: list) -> list[list]:
+        if not self.config.merge_enabled or self.config.merge_length <= 0:
+            return [[p] for p in paragraphs]
+
+        groups: list[list] = []
+        current: list = []
+        current_len = 0
+        for para in paragraphs:
+            text_len = len(para.original)
+            if current and current_len + text_len > self.config.merge_length:
+                groups.append(current)
+                current = []
+                current_len = 0
+            current.append(para)
+            current_len += text_len
+        if current:
+            groups.append(current)
+        return groups
+
+    def _merge_prompt(self) -> str:
+        return (
+            self.config.prompt
+            + "\n\nYou will receive a JSON array of segments. Translate each "
+              "segment text independently and preserve all segment ids. Return "
+              "only valid JSON in this exact shape: "
+              '[{"id":"0","text":"translated text"}]. Do not wrap it in '
+              "Markdown and do not add explanations."
+        )
+
+    def _parse_merged_result(self, response: str, expected_ids: set[str]) -> dict[str, str]:
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text).strip()
+        start = min([i for i in (text.find("["), text.find("{")) if i >= 0], default=-1)
+        if start > 0:
+            text = text[start:]
+
+        data = json.loads(text)
+        result: dict[str, str] = {}
+        if isinstance(data, dict):
+            if isinstance(data.get("segments"), list):
+                data = data["segments"]
+            elif isinstance(data.get("translations"), list):
+                data = data["translations"]
+            else:
+                result = {str(k): str(v) for k, v in data.items()}
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    raise ValueError("合并翻译返回的数组元素不是对象")
+                sid = str(item.get("id", ""))
+                value = item.get("text", item.get("translation", ""))
+                result[sid] = str(value)
+
+        if set(result) != expected_ids:
+            raise ValueError("合并翻译返回的 segment id 不完整")
+        empty = [sid for sid, value in result.items() if not value.strip()]
+        if empty:
+            raise ValueError("合并翻译返回空译文")
+        return result
+
+    def _translate_group(self, group: list) -> dict[str, str]:
+        if len(group) == 1:
+            para = group[0]
+            text = self.glossary.apply(para.original)
+            result = self._translate_one(text)
+            return {para.id: self.glossary.restore(result).strip()}
+
+        segments = [
+            {"id": str(i), "text": self.glossary.apply(para.original)}
+            for i, para in enumerate(group)
+        ]
+        payload = json.dumps(segments, ensure_ascii=False)
+        expected_ids = {str(i) for i in range(len(group))}
+
+        try:
+            response = self._translate_one(payload, prompt=self._merge_prompt())
+            merged = self._parse_merged_result(response, expected_ids)
+            return {
+                para.id: self.glossary.restore(merged[str(i)]).strip()
+                for i, para in enumerate(group)
+            }
+        except Exception as e:
+            if _is_permanent_translation_error(e):
+                raise
+            logging.warning("合并翻译解析失败，回退逐段: %s", e)
+            fallback: dict[str, str] = {}
+            for para in group:
+                text = self.glossary.apply(para.original)
+                result = self._translate_one(text)
+                fallback[para.id] = self.glossary.restore(result).strip()
+            return fallback
+
     async def translate_batch(self, paragraphs: list, concurrency: int = 3,
                               interval: float = 1.0):
+        concurrency = max(1, int(concurrency or 1))
         sem = asyncio.Semaphore(concurrency)
         done_count = 0
         failed_count = 0
+        stop_requested = False
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+        groups = self._merge_groups(paragraphs)
 
-        async def translate_one(para):
-            nonlocal done_count, failed_count
+        async def translate_group(group):
+            nonlocal done_count, failed_count, stop_requested
             async with sem:
-                loop = asyncio.get_event_loop()
-                try:
-                    text = self.glossary.apply(para.original)
-                    result = await loop.run_in_executor(
-                        None, self._translate_one, text
-                    )
-                    result = self.glossary.restore(result)
-                    self.cache.update_translation(
-                        para.id, result.strip(),
-                        self.config.engine, self.config.target_lang,
-                    )
-                    done_count += 1
-                    self.abort_count = 0
-                except Exception as e:
-                    failed_count += 1
-                    self.abort_count += 1
+                if stop_requested:
+                    failed_count += len(group)
                     if self.progress_callback:
+                        self.progress_callback("update", len(group))
+                    return
+                loop = asyncio.get_running_loop()
+                try:
+                    result_map = await loop.run_in_executor(
+                        executor, self._translate_group, group
+                    )
+                    for para in group:
+                        result = result_map.get(para.id, "").strip()
+                        if not result:
+                            raise RuntimeError("API 返回空译文")
+                        self.cache.update_translation(
+                            para.id, result,
+                            self.config.engine, self.config.target_lang,
+                        )
+                        done_count += 1
+                    with self._abort_lock:
+                        self.abort_count = 0
+                except Exception as e:
+                    failed_count += len(group)
+                    with self._abort_lock:
+                        self.abort_count += 1
+                        abort_count = self.abort_count
+                    if self.progress_callback:
+                        sample = group[0].original if group else ""
                         self.progress_callback(
                             "write",
-                            _c(f"  ✗ 翻译失败: {para.original[:60]}... -> {str(e)[:80]}", _RED),
+                            _c(f"  ✗ 翻译失败: {sample[:60]}... -> {str(e)[:80]}", _RED),
                         )
                     if (self.config.max_error_count > 0
-                            and self.abort_count >= self.config.max_error_count):
-                        raise RuntimeError("连续错误次数过多，中止翻译")
+                            and abort_count >= self.config.max_error_count):
+                        stop_requested = True
                 finally:
                     if self.progress_callback:
-                        self.progress_callback("update", 1)
+                        self.progress_callback("update", len(group))
                 if interval > 0:
                     await asyncio.sleep(interval)
 
-        tasks = [translate_one(p) for p in paragraphs]
-        await asyncio.gather(*tasks)
-        return done_count, failed_count
+        try:
+            tasks = [translate_group(group) for group in groups]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logging.error(
+                        "翻译任务异常: %s",
+                        result,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+            return done_count, failed_count
+        finally:
+            executor.shutdown(wait=True)
 
 # ---------------------------------------------------------------------------
 # 单本书翻译流程
@@ -198,6 +379,7 @@ def translate_book(
 
     book_name = Path(input_path).stem
     char_count = 0
+    logging.info("开始处理: %s", input_path)
 
     def _status(msg):
         if book_pbar:
@@ -238,15 +420,18 @@ def translate_book(
 
     # --- 步骤 3: 设置缓存 ---
     _status(_c("检查缓存", _CYAN))
-    cache_key = md5(
-        working_epub + config.engine + config.target_lang + str(config.merge_length)
-    )
-    cache_dir = os.path.join(config.cache_dir, "books")
-    cache = TranslationCache(os.path.join(cache_dir, f"{cache_key}.db"))
+    cache_key = _build_cache_key(input_path, elements, config, glossary)
+    if config.cache_enabled:
+        cache_dir = os.path.join(config.cache_dir, "books")
+        cache = TranslationCache(os.path.join(cache_dir, f"{cache_key}.db"))
+        logging.info("缓存文件: %s", cache.db_path)
+    else:
+        cache = TranslationCache(":memory:", persistence=False)
+        logging.info("缓存已禁用: 使用内存缓存")
     cache.set_info("title", title)
     cache.set_info("engine", config.engine)
     cache.set_info("target_lang", config.target_lang)
-    cache.set_info("source", input_path)
+    cache.set_info("source", str(Path(input_path).resolve()))
 
     rows = build_cache_rows(elements)
     cache.save_paragraphs(rows)
@@ -285,8 +470,16 @@ def translate_book(
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
 
+        def _progress(event, value):
+            if event == "update":
+                trans_pbar.update(value)
+            elif event == "write":
+                trans_pbar.write(value)
+            elif event == "desc":
+                trans_pbar.set_description(value)
+
         worker = TranslationWorker(engine, cache, config, glossary,
-                                    progress_callback=trans_pbar.set_description)
+                                    progress_callback=_progress)
 
         start = time.time()
         try:
@@ -310,26 +503,50 @@ def translate_book(
                 msg += _c(f", 失败 {failed}", _RED)
             msg += _c(f" [{elapsed:.1f}s]", _DIM)
             book_pbar.write(msg)
+        logging.info(
+            "翻译完成: %s, total=%s, done=%s, failed=%s, cached=%s, elapsed=%.1fs",
+            title, total, done, failed, already, elapsed,
+        )
+        if failed > 0:
+            _err(f"{title}: {failed} 段翻译失败，已保留进度，未生成输出",
+                 book_pbar, overall_pbar)
+            cache.close()
+            _cleanup(tmp_epub)
+            return False
     else:
         if book_pbar:
             book_pbar.write(
                 f"  ✓ {title}: {total} 段全部已缓存 "
                 + _c(f"({char_count} 字符)", _DIM)
             )
+        logging.info("全部命中缓存: %s, total=%s", title, total)
 
     # --- 步骤 5: 注入翻译 ---
     _status(_c("写入译文", _CYAN))
     all_paras = cache.get_all()
+    missing = [p for p in all_paras if not p.translation]
+    if missing:
+        _err(f"{title}: 仍有 {len(missing)} 段未翻译，未生成输出",
+             book_pbar, overall_pbar)
+        cache.close()
+        _cleanup(tmp_epub)
+        return False
     trans_map = {p.id: p.translation for p in all_paras if p.translation}
 
     translated_epub = os.path.join(
         os.path.dirname(output_path) or ".", f".{book_name}_translated.epub"
     )
     try:
-        write_translated_epub(working_epub, translated_epub, trans_map,
-                              position=config.translation_position)
+        injected = write_translated_epub(
+            working_epub, translated_epub, trans_map,
+            position=config.translation_position,
+            expected_count=len(trans_map),
+        )
+        logging.info("写入译文: %s, injected=%s", title, injected)
     except Exception as e:
         _err(f"写入译文失败: {e}", book_pbar, overall_pbar)
+        if os.path.exists(translated_epub):
+            os.remove(translated_epub)
         cache.close()
         _cleanup(tmp_epub)
         return False
@@ -342,10 +559,11 @@ def translate_book(
             convert(translated_epub, final_path, output_format,
                     config.ebook_convert_path)
         except ConverterError as e:
-            _err(f"输出转换失败({e})，回退保存为 EPUB", book_pbar, overall_pbar)
             import shutil
             fallback = output_path.rsplit(".", 1)[0] + ".epub"
             shutil.move(translated_epub, fallback)
+            _err(f"输出转换失败({e})，已回退保存为 EPUB: {fallback}",
+                 book_pbar, overall_pbar)
             cache.close()
             _cleanup(tmp_epub)
             return False
@@ -357,6 +575,7 @@ def translate_book(
 
     cache.close()
     _cleanup(tmp_epub)
+    logging.info("处理完成: %s -> %s", input_path, final_path)
     return True
 
 
@@ -416,12 +635,13 @@ def main(argv: list[str] | None = None):
     # 设置日志
     if config.log_file:
         os.makedirs(os.path.dirname(config.log_file) or ".", exist_ok=True)
-        import logging
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s [%(levelname)s] %(message)s",
             handlers=[logging.FileHandler(config.log_file, encoding="utf-8")],
+            force=True,
         )
+        logging.info("启动 ebook-translator v%s", __version__)
 
     # 打印 banner
     if sys.stderr.isatty():
@@ -438,21 +658,25 @@ def main(argv: list[str] | None = None):
     # 收集书籍
     books = collect_books(args.input)
     if not books:
+        logging.error("未找到支持的电子书文件: %s", args.input)
         print(_c("错误: ", _RED) + f"在 {args.input} 中未找到支持的电子书文件", file=sys.stderr)
         print(_c(f"支持的格式: {', '.join(sorted(SUPPORTED_INPUT_FORMATS))}", _DIM), file=sys.stderr)
         sys.exit(1)
+    logging.info("找到 %s 本书", len(books))
 
     # 预览模式
     if args.dry_run:
         print(_c(f"\n找到 {len(books)} 本书:\n", _BOLD))
         for b in books:
             print(f"  {Path(b).name}  {_c(f'({_human_size(b)})', _DIM)}")
+            logging.info("dry-run: %s", b)
         print()
         return
 
     # 检查输出目录
     os.makedirs(args.output, exist_ok=True)
     if not os.access(args.output, os.W_OK):
+        logging.error("输出目录无写入权限: %s", args.output)
         print(_c("错误: ", _RED) + f"输出目录无写入权限: {args.output}", file=sys.stderr)
         sys.exit(1)
 
@@ -469,6 +693,7 @@ def main(argv: list[str] | None = None):
         try:
             find_ebook_convert(config.ebook_convert_path)
         except ConverterError:
+            logging.error("未找到 ebook-convert，无法输出 %s", output_format)
             print(
                 _c("错误: ", _RED) +
                 f"输出格式为 .{output_format} 但未找到 ebook-convert\n" +
@@ -478,7 +703,6 @@ def main(argv: list[str] | None = None):
             sys.exit(1)
 
     # 处理书籍
-    output_format = args.output_format.lower()
     results: list[dict] = []  # 每本书的结果
     interrupted = False
 
@@ -526,6 +750,7 @@ def main(argv: list[str] | None = None):
 
         # 检查输出是否已存在
         if os.path.exists(out_path) and not args.force:
+            logging.info("跳过已有输出: %s", out_path)
             overall_pbar.write(
                 f"  ⏭ 跳过: {stem}"
                 + _c(f" (输出文件已存在，使用 --force 覆盖)", _DIM)
@@ -542,12 +767,15 @@ def main(argv: list[str] | None = None):
                 overall_pbar=overall_pbar,
             )
             book_result["success"] = ok
+            logging.info("书籍结果: %s success=%s", book_path, ok)
         except KeyboardInterrupt:
             interrupted = True
             book_result["success"] = False
+            logging.warning("收到中断: %s", book_path)
         except Exception as e:
             _err(f"处理失败 {stem}: {e}", overall_pbar)
             book_result["success"] = False
+            logging.exception("处理失败: %s", book_path)
 
         results.append(book_result)
         overall_pbar.update(1)
@@ -560,6 +788,11 @@ def main(argv: list[str] | None = None):
     # 打印摘要
     batch_elapsed = time.time() - batch_start
     _print_summary(results, batch_elapsed, interrupted)
+    failed = sum(1 for r in results if not r["success"] and not r["skipped"])
+    if interrupted:
+        sys.exit(130)
+    if failed > 0:
+        sys.exit(1)
 
 
 def _print_summary(results: list[dict], elapsed: float, interrupted: bool):

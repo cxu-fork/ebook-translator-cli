@@ -32,14 +32,14 @@ class EngineConfig:
     api_key: str = ""
     base_url: str = ""
     model: str = ""
-    temperature: float = 1.0
+    temperature: float = 0.3
     top_p: float = 1.0
     concurrency: int = 3
     request_interval: float = 1.0
     request_timeout: float = 60.0
     max_retries: int = 3
     retry_delay: float = 5.0
-    stream: bool = True
+    stream: bool = False
     extra: dict = field(default_factory=dict)
 
 
@@ -109,5 +109,19 @@ def load_config(path: str | Path | None) -> Config:
     if not cfg.cache_dir:
         cfg.cache_dir = os.path.join(
             os.path.expanduser("~"), ".cache", "ebook-translator")
+    else:
+        cfg.cache_dir = os.path.expanduser(cfg.cache_dir)
+
+    if cfg.glossary_path:
+        cfg.glossary_path = os.path.expanduser(cfg.glossary_path)
+    if cfg.ebook_convert_path and os.sep in cfg.ebook_convert_path:
+        cfg.ebook_convert_path = os.path.expanduser(cfg.ebook_convert_path)
+    if cfg.log_file:
+        cfg.log_file = os.path.expanduser(cfg.log_file)
+
+    if cfg.translation_position not in {"below", "above", "only"}:
+        raise ValueError(
+            "translation_position 必须是 below、above 或 only"
+        )
 
     return cfg

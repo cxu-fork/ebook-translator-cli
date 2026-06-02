@@ -33,8 +33,14 @@ class TranslationCache:
         self.db_path = db_path
         self.persistence = persistence
         self._lock = threading.Lock()
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        if persistence:
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            sqlite_path = db_path
+        else:
+            sqlite_path = ":memory:"
+        self.conn = sqlite3.connect(sqlite_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self._create_tables()

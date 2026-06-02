@@ -7,11 +7,11 @@ This module handles:
   - Injecting translations back into the XHTML DOM
   - Writing the translated EPUB back out
 """
-import os
+import posixpath
 import re
 import zipfile
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
+from urllib.parse import unquote, urldefrag
 from typing import Any
 
 from lxml import etree
@@ -23,7 +23,9 @@ NS_DC = "http://purl.org/dc/elements/1.1/"
 NS_NCX = "http://www.daisy.org/z3986/2005/ncx/"
 CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 
-# Block-level elements whose text content is a translation unit
+# Block-level elements used as text boundaries. A node becomes a translation
+# unit only when it has no block-level descendants, so containers do not swallow
+# whole chapters.
 BLOCK_TAGS = {
     "p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "th", "td",
     "caption", "blockquote", "dt", "dd", "figcaption",
@@ -87,8 +89,11 @@ def _parse_opf(zf: zipfile.ZipFile, opf_path: str):
 
 
 def _resolve_href(base: str, href: str) -> str:
-    base_dir = os.path.dirname(base)
-    return os.path.normpath(os.path.join(base_dir, href)) if base_dir else href
+    base_dir = posixpath.dirname(base.replace("\\", "/"))
+    href = urldefrag(href)[0]
+    href = unquote(href).replace("\\", "/")
+    resolved = posixpath.normpath(posixpath.join(base_dir, href)) if base_dir else href
+    return "" if resolved == "." else resolved
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +111,7 @@ def _extract_text(el: etree._Element) -> str:
         parts.append(_extract_text(child))
         if child.tail:
             parts.append(child.tail)
-    raw = " ".join(parts)
+    raw = "".join(parts)
     return re.sub(r"\s+", " ", raw).strip()
 
 
@@ -119,6 +124,27 @@ def _is_inline_only(el: etree._Element) -> bool:
         if _localname(child.tag) in BLOCK_TAGS:
             return False
     return True
+
+
+def _parse_content_page(data: bytes) -> tuple[etree._Element, bool]:
+    """Parse a content document.
+
+    Returns ``(tree, recovered)`` where ``recovered`` means the XML parser failed
+    and the HTML recovery parser was used. KindleUnpack MOBI7 output often lands
+    in this bucket; extraction and injection must handle it consistently.
+    """
+    try:
+        return etree.fromstring(data), False
+    except etree.XMLSyntaxError:
+        parser = etree.HTMLParser(recover=True)
+        return etree.fromstring(data, parser=parser), True
+
+
+def _find_body(tree: etree._Element) -> etree._Element | None:
+    body = tree.find(f".//{{{NS_XHTML}}}body")
+    if body is None:
+        body = tree.find(".//body")
+    return body
 
 
 def _extract_elements(root: etree._Element, page_href: str) -> list[ExtractedElement]:
@@ -138,7 +164,7 @@ def _extract_elements(root: etree._Element, page_href: str) -> list[ExtractedEle
             text = _extract_text(child)
             if not text:
                 continue
-            if tag in BLOCK_TAGS or _is_inline_only(child):
+            if _is_inline_only(child):
                 raw = etree.tostring(child, encoding="unicode", with_tail=False)
                 uid = _md5(f"{page_href}:{idx}")
                 results.append(ExtractedElement(
@@ -180,17 +206,10 @@ def extract_from_epub(epub_path: str) -> tuple[list[ExtractedElement], dict]:
                 continue
             data = zf.read(resolved)
             try:
-                tree = etree.fromstring(data)
-            except etree.XMLSyntaxError:
-                # HTML 格式（如 KindleUnpack 输出的 MOBI7）用 lenient parser
-                try:
-                    parser = etree.HTMLParser(recover=True)
-                    tree = etree.fromstring(data, parser=parser)
-                except Exception:
-                    continue
-            body = tree.find(f".//{{{NS_XHTML}}}body")
-            if body is None:
-                body = tree.find(".//body")
+                tree, _recovered = _parse_content_page(data)
+            except Exception:
+                continue
+            body = _find_body(tree)
             if body is None:
                 continue
             elements.extend(_extract_elements(body, href))
@@ -211,16 +230,17 @@ def build_cache_rows(elements: list[ExtractedElement]) -> list[tuple]:
 # ---------------------------------------------------------------------------
 # Translation injection
 # ---------------------------------------------------------------------------
+def _make_translation_fragment(el: etree._Element, translation: str) -> etree._Element:
+    tag = f"{{{NS_XHTML}}}div" if el.tag.startswith("{") else "div"
+    frag = etree.Element(tag)
+    frag.set("class", "et-translation")
+    frag.text = translation
+    return frag
+
+
 def _inject_translation(el: etree._Element, translation: str,
                         position: str = "below"):
-    try:
-        frag = etree.fromstring(
-            f"<div xmlns='{NS_XHTML}' class='et-translation'>{translation}</div>"
-        )
-    except etree.XMLSyntaxError:
-        frag = etree.SubElement(etree.Element("dummy"), f"{{{NS_XHTML}}}div")
-        frag.set("class", "et-translation")
-        frag.text = translation
+    frag = _make_translation_fragment(el, translation)
 
     if position == "only":
         parent = el.getparent()
@@ -235,26 +255,33 @@ def _inject_translation(el: etree._Element, translation: str,
 
 
 def _inject_recursive(parent: etree._Element, page_href: str,
-                      translations: dict[str, str], position: str):
+                      translations: dict[str, str], position: str) -> int:
     """Walk the DOM, injecting translations using the same page-local uid
     scheme as extraction.
     """
     idx = 0
-    for child in list(parent):
-        tag = _localname(child.tag)
-        if _should_skip(child):
-            continue
-        text = _extract_text(child)
-        if not text:
-            continue
-        if tag in BLOCK_TAGS or _is_inline_only(child):
-            uid = _md5(f"{page_href}:{idx}")
-            trans = translations.get(uid)
-            if trans:
-                _inject_translation(child, trans, position)
-            idx += 1
-        else:
-            _inject_recursive(child, page_href, translations, position)
+
+    def walk(node: etree._Element) -> int:
+        nonlocal idx
+        injected = 0
+        for child in list(node):
+            if _should_skip(child):
+                continue
+            text = _extract_text(child)
+            if not text:
+                continue
+            if _is_inline_only(child):
+                uid = _md5(f"{page_href}:{idx}")
+                trans = translations.get(uid)
+                if trans:
+                    _inject_translation(child, trans, position)
+                    injected += 1
+                idx += 1
+            else:
+                injected += walk(child)
+        return injected
+
+    return walk(parent)
 
 
 def write_translated_epub(
@@ -262,7 +289,9 @@ def write_translated_epub(
     output_path: str,
     translations: dict[str, str],
     position: str = "below",
-):
+    expected_count: int | None = None,
+) -> int:
+    injected_total = 0
     with zipfile.ZipFile(epub_path, "r") as zin:
         opf_path = _read_container(zin)
         manifest, spine_hrefs, _ = _parse_opf(zin, opf_path)
@@ -274,23 +303,34 @@ def write_translated_epub(
                 data = zin.read(item.filename)
                 if item.filename in resolved_map:
                     href = resolved_map[item.filename]
-                    data = _inject_into_page(data, href, translations, position)
+                    data, injected = _inject_into_page(
+                        data, href, translations, position)
+                    injected_total += injected
                 zout.writestr(item, data)
+    if expected_count is None:
+        expected_count = len(translations)
+    if expected_count and injected_total != expected_count:
+        raise ValueError(
+            f"译文注入数量不匹配: 预期 {expected_count}, 实际 {injected_total}"
+        )
+    return injected_total
 
 
 def _inject_into_page(data: bytes, page_href: str,
                       translations: dict[str, str],
-                      position: str) -> bytes:
+                      position: str) -> tuple[bytes, int]:
     try:
-        tree = etree.fromstring(data)
-    except etree.XMLSyntaxError:
-        return data
+        tree, recovered = _parse_content_page(data)
+    except Exception:
+        return data, 0
 
-    body = tree.find(f".//{{{NS_XHTML}}}body")
+    body = _find_body(tree)
     if body is None:
-        body = tree.find(".//body")
-    if body is None:
-        return data
+        return data, 0
 
-    _inject_recursive(body, page_href, translations, position)
-    return etree.tostring(tree, encoding="utf-8", xml_declaration=True)
+    injected = _inject_recursive(body, page_href, translations, position)
+    if recovered:
+        output = etree.tostring(tree, encoding="utf-8", method="html")
+    else:
+        output = etree.tostring(tree, encoding="utf-8", xml_declaration=True)
+    return output, injected

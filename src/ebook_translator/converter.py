@@ -50,23 +50,46 @@ def _repack_epub_from_dir(base_dir: str) -> str | None:
     import zipfile
 
     opf_path = None
-    opf_rel = None
     for root, dirs, files in os.walk(base_dir):
         if 'content.opf' in files:
             opf_path = os.path.join(root, 'content.opf')
-            opf_rel = os.path.relpath(root, base_dir)
             break
     if opf_path is None:
         return None
 
-    book_dir = os.path.dirname(opf_path)
+    epub_root = None
+    current = os.path.dirname(opf_path)
+    while True:
+        if (os.path.isdir(os.path.join(current, "META-INF"))
+                or os.path.isfile(os.path.join(current, "mimetype"))):
+            epub_root = current
+            break
+        if os.path.abspath(current) == os.path.abspath(base_dir):
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    if epub_root is None:
+        subdirs = [
+            os.path.join(base_dir, d)
+            for d in os.listdir(base_dir)
+            if os.path.isdir(os.path.join(base_dir, d))
+        ]
+        if len(subdirs) == 1 and os.path.commonpath([subdirs[0], opf_path]) == subdirs[0]:
+            epub_root = subdirs[0]
+        else:
+            epub_root = base_dir
+
+    opf_full_path = os.path.relpath(opf_path, epub_root).replace(os.sep, "/")
     epub_path = os.path.join(base_dir, "output.epub")
 
     # 生成 META-INF/container.xml
     container_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
-        '<rootfiles><rootfile full-path="content.opf" '
+        f'<rootfiles><rootfile full-path="{opf_full_path}" '
         'media-type="application/oebps-package+xml"/>'
         '</rootfiles></container>'
     )
@@ -78,10 +101,12 @@ def _repack_epub_from_dir(base_dir: str) -> str | None:
         # META-INF/container.xml
         zf.writestr("META-INF/container.xml", container_xml)
         # 书的所有文件
-        for root, dirs, files in os.walk(book_dir):
+        for root, dirs, files in os.walk(epub_root):
             for f in files:
                 full = os.path.join(root, f)
-                arcname = os.path.relpath(full, book_dir)
+                arcname = os.path.relpath(full, epub_root).replace(os.sep, "/")
+                if arcname in {"mimetype", "META-INF/container.xml"}:
+                    continue
                 zf.write(full, arcname)
     return epub_path
 
@@ -107,7 +132,13 @@ def find_ebook_convert(custom_path: str = "") -> str:
         "/usr/local/bin/ebook-convert",
         os.path.expanduser("~/.local/bin/ebook-convert"),
         "/Applications/calibre.app/Contents/MacOS/ebook-convert",
+        r"C:\Program Files\Calibre2\ebook-convert.exe",
+        r"C:\Program Files (x86)\Calibre2\ebook-convert.exe",
     ]
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(env_name)
+        if root:
+            candidates.append(os.path.join(root, "Calibre2", "ebook-convert.exe"))
     for c in candidates:
         if os.path.isfile(c):
             return c
@@ -146,14 +177,24 @@ def convert(input_path: str, output_path: str, output_format: str,
     input_ext = Path(input_path).suffix.lstrip(".").lower()
 
     # MOBI/AZW3 -> EPUB: 优先用 KindleUnpack (纯 Python, 无需 calibre)
+    kindleunpack_error = None
     if input_ext in ("mobi", "azw3") and output_format == "epub":
         try:
             return _kindleunpack_to_epub(input_path, output_path)
-        except Exception:
-            pass  # 回退到 ebook-convert
+        except Exception as e:
+            kindleunpack_error = e
 
     # 其他情况: 用 ebook-convert
-    return _ebook_convert(input_path, output_path, output_format, ebook_convert_path)
+    try:
+        return _ebook_convert(input_path, output_path, output_format, ebook_convert_path)
+    except ConverterError as e:
+        if kindleunpack_error is not None:
+            raise ConverterError(
+                "KindleUnpack 转换失败，ebook-convert 回退也失败。\n\n"
+                f"KindleUnpack 错误: {kindleunpack_error}\n\n"
+                f"ebook-convert 错误: {e}"
+            ) from e
+        raise
 
 
 def convert_to_epub(input_path: str, ebook_convert_path: str = "") -> str:

@@ -20,6 +20,8 @@ class AnthropicEngine(TranslationEngine):
         self.model = config.model or _DEFAULT_MODEL
         self.temperature = config.temperature
         self.base_url = (config.base_url or "https://api.anthropic.com").rstrip("/")
+        self.messages_url = self._endpoint("/v1/messages")
+        self.stream = config.stream
 
     def _headers(self) -> dict:
         return {
@@ -27,6 +29,11 @@ class AnthropicEngine(TranslationEngine):
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
         }
+
+    def _endpoint(self, suffix: str) -> str:
+        if self.base_url.endswith(suffix):
+            return self.base_url
+        return f"{self.base_url}{suffix}"
 
     def _body(self, text: str, prompt: str, stream: bool) -> dict:
         body: dict = {
@@ -43,12 +50,14 @@ class AnthropicEngine(TranslationEngine):
         return body
 
     def translate(self, text: str, prompt: str = "") -> str:
+        if self.stream:
+            return "".join(self.translate_stream(text, prompt)).strip()
         prompt = self.build_prompt(prompt)
         body = self._body(text, prompt, stream=False)
         timeout = httpx.Timeout(self.config.request_timeout, connect=10)
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(
-                f"{self.base_url}/v1/messages",
+                self.messages_url,
                 headers=self._headers(),
                 json=body,
             )
@@ -70,10 +79,14 @@ class AnthropicEngine(TranslationEngine):
         with httpx.Client(timeout=timeout) as client:
             with client.stream(
                 "POST",
-                f"{self.base_url}/v1/messages",
+                self.messages_url,
                 headers=self._headers(),
                 json=body,
             ) as resp:
+                if resp.status_code == 401:
+                    raise RuntimeError("API 密钥无效或已过期")
+                if resp.status_code == 429:
+                    raise RuntimeError("API 请求频率超限，请稍后重试")
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     line = line.strip()
