@@ -627,6 +627,14 @@ def _human_size(path: str) -> str:
 # CLI 主函数
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None):
+    # Windows 终端编码兜底：避免中文/Unicode 符号输出时 UnicodeEncodeError
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None:
+            try:
+                _stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
     from tqdm import tqdm
 
     args = _parse_args(argv)
