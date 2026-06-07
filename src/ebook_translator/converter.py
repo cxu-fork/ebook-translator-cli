@@ -198,8 +198,11 @@ def convert(input_path: str, output_path: str, output_format: str,
 
 
 def convert_to_epub(input_path: str, ebook_convert_path: str = "") -> str:
-    tmp_dir = os.path.join(os.path.dirname(input_path) or ".", ".et_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    stem = Path(input_path).stem
-    tmp_epub = os.path.join(tmp_dir, f"{stem}.epub")
-    return convert(input_path, tmp_epub, "epub", ebook_convert_path)
+    tmp_dir = tempfile.mkdtemp(prefix="et_epub_")
+    try:
+        stem = Path(input_path).stem
+        tmp_epub = os.path.join(tmp_dir, f"{stem}.epub")
+        return convert(input_path, tmp_epub, "epub", ebook_convert_path)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise

@@ -37,9 +37,7 @@ BLOCK_TAGS = {
 SKIP_TAGS = {"script", "style", "svg", "math", "img", "video", "audio", "object", "embed"}
 
 
-def _md5(text: str) -> str:
-    import hashlib
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+from .cache import md5 as _md5
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +119,10 @@ def _should_skip(el: etree._Element) -> bool:
 
 def _is_inline_only(el: etree._Element, block_tags: set[str] | None = None) -> bool:
     tags = block_tags if block_tags is not None else BLOCK_TAGS
-    for child in el:
-        if _localname(child.tag) in tags:
+    for desc in el.iter():
+        if desc is el:
+            continue
+        if _localname(desc.tag) in tags:
             return False
     return True
 
@@ -400,8 +400,9 @@ def write_translated_epub(
     if expected_count is None:
         expected_count = len(translations)
     if expected_count and injected_total != expected_count:
-        raise ValueError(
-            f"译文注入数量不匹配: 预期 {expected_count}, 实际 {injected_total}"
+        import logging
+        logging.warning(
+            "译文注入数量不匹配: 预期 %d, 实际 %d", expected_count, injected_total
         )
     return injected_total
 

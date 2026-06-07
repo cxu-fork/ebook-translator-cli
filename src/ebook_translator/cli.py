@@ -90,7 +90,10 @@ class Glossary:
                 continue
             lines = group.split("\n")
             src = lines[0].strip()
-            tgt = lines[1].strip() if len(lines) > 1 else src
+            if len(lines) < 2:
+                logging.warning("术语表条目缺少翻译行，已跳过: %r", src)
+                continue
+            tgt = lines[1].strip()
             if src:
                 self.pairs.append((src, tgt))
         self.pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
@@ -233,7 +236,8 @@ class TranslationWorker:
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\s*```$", "", text).strip()
-        start = min([i for i in (text.find("["), text.find("{")) if i >= 0], default=-1)
+        candidates = [i for i in (text.find("["), text.find("{")) if i >= 0]
+        start = min(candidates) if candidates else -1
         if start > 0:
             text = text[start:]
 
@@ -295,18 +299,19 @@ class TranslationWorker:
 
     async def translate_batch(self, paragraphs: list, concurrency: int = 3,
                               interval: float = 1.0):
-        concurrency = max(1, int(concurrency or 1))
+        _MAX_CONCURRENCY = 32
+        concurrency = max(1, min(int(concurrency or 1), _MAX_CONCURRENCY))
         sem = asyncio.Semaphore(concurrency)
         done_count = 0
         failed_count = 0
-        stop_requested = False
+        stop_event = asyncio.Event()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
         groups = self._merge_groups(paragraphs)
 
         async def translate_group(group):
-            nonlocal done_count, failed_count, stop_requested
+            nonlocal done_count, failed_count
             async with sem:
-                if stop_requested:
+                if stop_event.is_set():
                     failed_count += len(group)
                     if self.progress_callback:
                         self.progress_callback("update", len(group))
@@ -354,12 +359,13 @@ class TranslationWorker:
                             )
                         if (self.config.max_error_count > 0
                                 and abort_count >= self.config.max_error_count):
-                            stop_requested = True
+                            stop_event.set()
                 finally:
                     if self.progress_callback:
                         self.progress_callback("update", len(group))
-                if interval > 0:
-                    await asyncio.sleep(interval)
+            # Rate-limit outside the semaphore so it doesn't block other tasks
+            if interval > 0:
+                await asyncio.sleep(interval)
 
         try:
             tasks = [translate_group(group) for group in groups]
