@@ -352,7 +352,8 @@ def _inject_recursive(parent: etree._Element, page_href: str,
                 injected += walk(child)
                 continue
             if (_is_inline_only(child, effective_blocks)
-                    and not _has_excluded_child(child, effective_exclude)):
+                    and not _has_excluded_child(child, effective_exclude)
+                    and not _is_non_translatable(text)):
                 uid = _md5(f"{page_href}:{idx}")
                 trans = translations.get(uid)
                 if trans:

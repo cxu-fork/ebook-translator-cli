@@ -8,7 +8,7 @@ from lxml import etree
 
 from ebook_translator.epub import (
     _extract_text, _resolve_href, extract_from_epub, write_translated_epub,
-    _is_non_translatable,
+    _is_non_translatable, _localname,
 )
 
 
@@ -193,6 +193,52 @@ class EpubTests(unittest.TestCase):
         self.assertIn("Real text here", originals)
         self.assertNotIn("https://example.com", originals)
         self.assertNotIn("Figure 1", originals)
+
+    def test_non_translatable_injection_alignment(self):
+        epub = self.tmp / "alignment.epub"
+        make_epub(
+            epub,
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            "<p>First paragraph</p>"
+            "<p>https://example.com</p>"
+            "<p>Second paragraph</p>"
+            "</body></html>",
+        )
+        elements, _ = extract_from_epub(str(epub))
+        self.assertEqual(2, len(elements))
+        self.assertEqual("First paragraph", elements[0].original)
+        self.assertEqual("Second paragraph", elements[1].original)
+
+        out = self.tmp / "out.epub"
+        translations = {
+            elements[0].uid: "第一段",
+            elements[1].uid: "第二段",
+        }
+        write_translated_epub(str(epub), str(out), translations, expected_count=2)
+
+        with zipfile.ZipFile(out) as zf:
+            data = zf.read("c.xhtml").decode("utf-8")
+        
+        tree = etree.fromstring(data.encode("utf-8"))
+        body = tree.find(".//body")
+        if body is None:
+            body = tree.find(".//{http://www.w3.org/1999/xhtml}body")
+        children = list(body)
+        
+        self.assertEqual("p", _localname(children[0].tag))
+        self.assertEqual("First paragraph", _extract_text(children[0]))
+        
+        self.assertEqual("div", _localname(children[1].tag))
+        self.assertEqual("第一段", _extract_text(children[1]))
+        
+        self.assertEqual("p", _localname(children[2].tag))
+        self.assertEqual("https://example.com", _extract_text(children[2]))
+        
+        self.assertEqual("p", _localname(children[3].tag))
+        self.assertEqual("Second paragraph", _extract_text(children[3]))
+        
+        self.assertEqual("div", _localname(children[4].tag))
+        self.assertEqual("第二段", _extract_text(children[4]))
 
 
 if __name__ == "__main__":

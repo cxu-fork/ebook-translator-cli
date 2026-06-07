@@ -276,6 +276,59 @@ class CliTests(unittest.TestCase):
         self.assertIn("color: red", data)
         self.assertIn("font-weight: bold", data)
 
+    def test_retranslate_target_file_skips_null_pages(self):
+        cache = TranslationCache(str(self.tmp / "retrans_null.db"))
+        cache.save_paragraphs([
+            ("p0", "m0", "", "para 0", False, None, None),  # null page
+            ("p1", "m1", "", "para 1", False, None, "chapter1.html"),
+        ])
+        cache.update_translation("p0", "trans 0", "engine", "zh")
+        cache.update_translation("p1", "trans 1", "engine", "zh")
+
+        cfg = Config(retranslate_file="chapter1.html", retranslate_start="para")
+        cli._do_retranslate(cache, [], cfg)
+
+        paras = cache.get_all()
+        p0 = next(p for p in paras if p.id == "p0")
+        p1 = next(p for p in paras if p.id == "p1")
+        self.assertEqual("trans 0", p0.translation)
+        self.assertIsNone(p1.translation)
+        cache.close()
+
+    def test_test_mode_auto_skip_failed(self):
+        epub = self.tmp / "test_auto.epub"
+        out = self.tmp / "out.epub"
+        make_epub(epub, ["one", "two", "three"])
+        
+        class Args:
+            config = ""
+            engine = ""
+            source_lang = ""
+            target_lang = ""
+            concurrency = 0
+            no_cache = False
+            skip_failed = False
+            log_file = ""
+            test = True
+            test_num = 1
+            retranslate_file = ""
+            retranslate_start = ""
+            retranslate_end = ""
+
+        cfg = cli._apply_overrides(Args())
+        self.assertTrue(cfg.test_enabled)
+        self.assertTrue(cfg.skip_failed)
+
+        with mock.patch.object(cli, "get_engine", return_value=FakeEngine):
+            ok = cli.translate_book(
+                str(epub), str(out), "epub", cfg, cli.Glossary(""))
+
+        self.assertTrue(ok)
+        with zipfile.ZipFile(out) as zf:
+            data = zf.read("c.xhtml").decode("utf-8")
+        self.assertIn("译文 one", data)
+        self.assertIn("two", data)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -391,7 +391,7 @@ def _do_retranslate(cache, elements, config):
     in_range = False
 
     for para in all_paras:
-        if target_file and para.page and target_file not in para.page:
+        if target_file and (not para.page or target_file not in para.page):
             continue
         if start_text and start_text in para.original:
             in_range = True
@@ -1022,6 +1022,8 @@ def _apply_overrides(args: argparse.Namespace) -> Config:
         config.log_file = args.log_file
     if args.test:
         config.test_enabled = True
+    if config.test_enabled:
+        config.skip_failed = True
     if args.test_num > 0:
         config.test_num = args.test_num
     if args.retranslate_file:
