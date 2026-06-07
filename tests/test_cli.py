@@ -217,5 +217,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(1, AlwaysFailEngine.calls)
 
 
+    def test_test_mode_limits_paragraphs(self):
+        epub = self.tmp / "test_mode.epub"
+        out = self.tmp / "out.epub"
+        make_epub(epub, ["one", "two", "three", "four", "five"])
+        self.config.test_enabled = True
+        self.config.test_num = 2
+        self.config.skip_failed = True
+
+        with mock.patch.object(cli, "get_engine", return_value=FakeEngine):
+            ok = cli.translate_book(
+                str(epub), str(out), "epub", self.config, cli.Glossary(""))
+
+        self.assertTrue(ok)
+        with zipfile.ZipFile(out) as zf:
+            data = zf.read("c.xhtml").decode("utf-8")
+        # All 5 paragraphs should exist in output (injection includes all)
+        # but only first 2 got translated, rest keep originals
+        self.assertIn("译文 one", data)
+        self.assertIn("译文 two", data)
+        # 3, 4, 5 were not translated, should keep original
+        self.assertIn("three", data)
+        self.assertIn("four", data)
+        self.assertIn("five", data)
+
+    def test_skip_failed_preserves_original_for_failed_paragraphs(self):
+        epub = self.tmp / "skip.epub"
+        out = self.tmp / "out.epub"
+        make_epub(epub, ["good", "bad", "ok"])
+        self.config.skip_failed = True
+        FakeEngine.fail_on = "bad"
+
+        with mock.patch.object(cli, "get_engine", return_value=FakeEngine):
+            ok = cli.translate_book(
+                str(epub), str(out), "epub", self.config, cli.Glossary(""))
+
+        self.assertTrue(ok)
+        with zipfile.ZipFile(out) as zf:
+            data = zf.read("c.xhtml").decode("utf-8")
+        self.assertIn("译文 good", data)
+        self.assertIn("译文 ok", data)
+        # "bad" paragraph should keep original since skip_failed=True
+        self.assertIn("bad", data)
+
+    def test_translation_style_passed_to_output(self):
+        epub = self.tmp / "style.epub"
+        out = self.tmp / "out.epub"
+        make_epub(epub, ["hello"])
+        self.config.translation_style = "color: red; font-weight: bold"
+
+        with mock.patch.object(cli, "get_engine", return_value=FakeEngine):
+            ok = cli.translate_book(
+                str(epub), str(out), "epub", self.config, cli.Glossary(""))
+
+        self.assertTrue(ok)
+        with zipfile.ZipFile(out) as zf:
+            data = zf.read("c.xhtml").decode("utf-8")
+        self.assertIn("color: red", data)
+        self.assertIn("font-weight: bold", data)
+
+
 if __name__ == "__main__":
     unittest.main()

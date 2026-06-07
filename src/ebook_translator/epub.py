@@ -119,11 +119,54 @@ def _should_skip(el: etree._Element) -> bool:
     return _localname(el.tag) in SKIP_TAGS
 
 
-def _is_inline_only(el: etree._Element) -> bool:
+def _is_inline_only(el: etree._Element, block_tags: set[str] | None = None) -> bool:
+    tags = block_tags if block_tags is not None else BLOCK_TAGS
     for child in el:
-        if _localname(child.tag) in BLOCK_TAGS:
+        if _localname(child.tag) in tags:
             return False
     return True
+
+
+
+# ---------------------------------------------------------------------------
+# Non-translatable text detection
+# ---------------------------------------------------------------------------
+_RE_URL = re.compile(r"https?://|www\.", re.IGNORECASE)
+_RE_ISBN = re.compile(r"ISBN[:\s]*\d", re.IGNORECASE)
+_RE_FIGURE = re.compile(
+    r"^(Figure|Fig\.?|Table|Listing|Source)[\s:]", re.IGNORECASE)
+
+
+def _is_non_translatable(text: str) -> bool:
+    """Detect URLs, ISBNs, pure numbers, figure/listing references."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if _RE_URL.search(stripped):
+        return True
+    if _RE_ISBN.search(stripped):
+        return True
+    # Pure number (including formatted: 1,234.56, -3.14e2, 99%)
+    if re.fullmatch(r"[\d,.\-+eE\s%]+", stripped):
+        return True
+    if _RE_FIGURE.match(stripped):
+        return True
+    return False
+
+
+def _parse_tag_set(s: str) -> set[str]:
+    """Parse a comma-separated tag string into a set of lowercased names."""
+    if not s:
+        return set()
+    return {t.strip().lower() for t in s.split(",") if t.strip()}
+
+
+def _has_excluded_child(el: etree._Element, exclude_tags: set[str]) -> bool:
+    """Return True if el has any descendant whose local tag is in exclude_tags."""
+    for desc in el.iter():
+        if desc is not el and _localname(desc.tag) in exclude_tags:
+            return True
+    return False
 
 
 def _parse_content_page(data: bytes) -> tuple[etree._Element, bool]:
@@ -147,13 +190,17 @@ def _find_body(tree: etree._Element) -> etree._Element | None:
     return body
 
 
-def _extract_elements(root: etree._Element, page_href: str) -> list[ExtractedElement]:
+def _extract_elements(root: etree._Element, page_href: str,
+                      translate_tags: set[str] | None = None,
+                      exclude_tags: set[str] | None = None) -> list[ExtractedElement]:
     """Walk the DOM and collect block-level translatable elements.
     Index is page-local (0-based per page) so uid is stable regardless of
     extraction order across pages.
     """
     results: list[ExtractedElement] = []
     idx = 0
+    effective_blocks = translate_tags if translate_tags else None
+    effective_exclude = exclude_tags or set()
 
     def walk(parent: etree._Element):
         nonlocal idx
@@ -164,7 +211,13 @@ def _extract_elements(root: etree._Element, page_href: str) -> list[ExtractedEle
             text = _extract_text(child)
             if not text:
                 continue
-            if _is_inline_only(child):
+            # When translate_tags is set, only extract matching tags.
+            if effective_blocks and tag not in effective_blocks:
+                walk(child)
+                continue
+            if (_is_inline_only(child, effective_blocks)
+                    and not _has_excluded_child(child, effective_exclude)
+                    and not _is_non_translatable(text)):
                 raw = etree.tostring(child, encoding="unicode", with_tail=False)
                 uid = _md5(f"{page_href}:{idx}")
                 results.append(ExtractedElement(
@@ -181,7 +234,11 @@ def _extract_elements(root: etree._Element, page_href: str) -> list[ExtractedEle
 # ---------------------------------------------------------------------------
 # Public API: extraction
 # ---------------------------------------------------------------------------
-def extract_from_epub(epub_path: str) -> tuple[list[ExtractedElement], dict]:
+def extract_from_epub(epub_path: str,
+                      only_files: str = "",
+                      exclude_files: str = "",
+                      translate_tags: str = "",
+                      exclude_translate_tags: str = "") -> tuple[list[ExtractedElement], dict]:
     elements: list[ExtractedElement] = []
     meta: dict[str, Any] = {"title": "", "spine_hrefs": []}
 
@@ -197,7 +254,18 @@ def extract_from_epub(epub_path: str) -> tuple[list[ExtractedElement], dict]:
 
         meta["spine_hrefs"] = spine_hrefs
 
+        _only = _parse_tag_set(only_files)
+        _exc_files = _parse_tag_set(exclude_files)
+        _t_tags = _parse_tag_set(translate_tags)
+        _e_tags = _parse_tag_set(exclude_translate_tags)
+
         for href in spine_hrefs:
+            # only_files / exclude_files filtering (filename-based)
+            base_name = href.rsplit("/", 1)[-1] if "/" in href else href
+            if _only and base_name not in _only and href not in _only:
+                continue
+            if _exc_files and (base_name in _exc_files or href in _exc_files):
+                continue
             resolved = _resolve_href(opf_path, href)
             if resolved not in zf.namelist():
                 continue
@@ -212,7 +280,8 @@ def extract_from_epub(epub_path: str) -> tuple[list[ExtractedElement], dict]:
             body = _find_body(tree)
             if body is None:
                 continue
-            elements.extend(_extract_elements(body, href))
+            elements.extend(_extract_elements(
+                body, href, translate_tags=_t_tags, exclude_tags=_e_tags))
 
     return elements, meta
 
@@ -230,17 +299,20 @@ def build_cache_rows(elements: list[ExtractedElement]) -> list[tuple]:
 # ---------------------------------------------------------------------------
 # Translation injection
 # ---------------------------------------------------------------------------
-def _make_translation_fragment(el: etree._Element, translation: str) -> etree._Element:
+def _make_translation_fragment(el: etree._Element, translation: str,
+                               style: str = "") -> etree._Element:
     tag = f"{{{NS_XHTML}}}div" if el.tag.startswith("{") else "div"
     frag = etree.Element(tag)
     frag.set("class", "et-translation")
+    if style:
+        frag.set("style", style)
     frag.text = translation
     return frag
 
 
 def _inject_translation(el: etree._Element, translation: str,
-                        position: str = "below"):
-    frag = _make_translation_fragment(el, translation)
+                        position: str = "below", style: str = ""):
+    frag = _make_translation_fragment(el, translation, style=style)
 
     if position == "only":
         parent = el.getparent()
@@ -255,11 +327,16 @@ def _inject_translation(el: etree._Element, translation: str,
 
 
 def _inject_recursive(parent: etree._Element, page_href: str,
-                      translations: dict[str, str], position: str) -> int:
+                      translations: dict[str, str], position: str,
+                      translate_tags: set[str] | None = None,
+                      exclude_tags: set[str] | None = None,
+                      style: str = "") -> int:
     """Walk the DOM, injecting translations using the same page-local uid
     scheme as extraction.
     """
     idx = 0
+    effective_blocks = translate_tags if translate_tags else None
+    effective_exclude = exclude_tags or set()
 
     def walk(node: etree._Element) -> int:
         nonlocal idx
@@ -270,11 +347,16 @@ def _inject_recursive(parent: etree._Element, page_href: str,
             text = _extract_text(child)
             if not text:
                 continue
-            if _is_inline_only(child):
+            tag = _localname(child.tag)
+            if effective_blocks and tag not in effective_blocks:
+                injected += walk(child)
+                continue
+            if (_is_inline_only(child, effective_blocks)
+                    and not _has_excluded_child(child, effective_exclude)):
                 uid = _md5(f"{page_href}:{idx}")
                 trans = translations.get(uid)
                 if trans:
-                    _inject_translation(child, trans, position)
+                    _inject_translation(child, trans, position, style=style)
                     injected += 1
                 idx += 1
             else:
@@ -290,8 +372,13 @@ def write_translated_epub(
     translations: dict[str, str],
     position: str = "below",
     expected_count: int | None = None,
+    style: str = "",
+    translate_tags: str = "",
+    exclude_translate_tags: str = "",
 ) -> int:
     injected_total = 0
+    _t_tags = _parse_tag_set(translate_tags)
+    _e_tags = _parse_tag_set(exclude_translate_tags)
     with zipfile.ZipFile(epub_path, "r") as zin:
         opf_path = _read_container(zin)
         manifest, spine_hrefs, _ = _parse_opf(zin, opf_path)
@@ -304,7 +391,9 @@ def write_translated_epub(
                 if item.filename in resolved_map:
                     href = resolved_map[item.filename]
                     data, injected = _inject_into_page(
-                        data, href, translations, position)
+                        data, href, translations, position,
+                        style=style, translate_tags=_t_tags,
+                        exclude_tags=_e_tags)
                     injected_total += injected
                 zout.writestr(item, data)
     if expected_count is None:
@@ -318,7 +407,10 @@ def write_translated_epub(
 
 def _inject_into_page(data: bytes, page_href: str,
                       translations: dict[str, str],
-                      position: str) -> tuple[bytes, int]:
+                      position: str,
+                      style: str = "",
+                      translate_tags: set[str] | None = None,
+                      exclude_tags: set[str] | None = None) -> tuple[bytes, int]:
     try:
         tree, recovered = _parse_content_page(data)
     except Exception:
@@ -328,7 +420,10 @@ def _inject_into_page(data: bytes, page_href: str,
     if body is None:
         return data, 0
 
-    injected = _inject_recursive(body, page_href, translations, position)
+    injected = _inject_recursive(body, page_href, translations, position,
+                                 translate_tags=translate_tags,
+                                 exclude_tags=exclude_tags,
+                                 style=style)
     if recovered:
         output = etree.tostring(tree, encoding="utf-8", method="html")
     else:

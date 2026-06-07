@@ -124,7 +124,7 @@ def _build_cache_key(input_path: str, elements: list, config: Config,
         separators=(",", ":"),
     ))
     payload = {
-        "cache_version": 2,
+        "cache_version": 3,
         "source_content_md5": _file_md5(input_path),
         "element_signature": element_sig,
         "engine": config.engine,
@@ -135,6 +135,9 @@ def _build_cache_key(input_path: str, elements: list, config: Config,
         "base_url": engine_cfg.base_url,
         "merge_enabled": config.merge_enabled,
         "merge_length": config.merge_length,
+        "translate_tags": config.translate_tags,
+        "exclude_translate_tags": config.exclude_translate_tags,
+        "translation_style": config.translation_style,
         "glossary": glossary.pairs,
     }
     return md5(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -325,19 +328,33 @@ class TranslationWorker:
                     with self._abort_lock:
                         self.abort_count = 0
                 except Exception as e:
-                    failed_count += len(group)
-                    with self._abort_lock:
-                        self.abort_count += 1
-                        abort_count = self.abort_count
-                    if self.progress_callback:
-                        sample = group[0].original if group else ""
-                        self.progress_callback(
-                            "write",
-                            _c(f"  ✗ 翻译失败: {sample[:60]}... -> {str(e)[:80]}", _RED),
-                        )
-                    if (self.config.max_error_count > 0
-                            and abort_count >= self.config.max_error_count):
-                        stop_requested = True
+                    if self.config.skip_failed:
+                        for para in group:
+                            self.cache.update_translation(
+                                para.id, para.original,
+                                "skipped", self.config.target_lang,
+                            )
+                            done_count += 1
+                        if self.progress_callback:
+                            sample = group[0].original if group else ""
+                            self.progress_callback(
+                                "write",
+                                _c(f"  ⚠ 跳过: {sample[:60]}... -> {str(e)[:80]}", _YELLOW),
+                            )
+                    else:
+                        failed_count += len(group)
+                        with self._abort_lock:
+                            self.abort_count += 1
+                            abort_count = self.abort_count
+                        if self.progress_callback:
+                            sample = group[0].original if group else ""
+                            self.progress_callback(
+                                "write",
+                                _c(f"  ✗ 翻译失败: {sample[:60]}... -> {str(e)[:80]}", _RED),
+                            )
+                        if (self.config.max_error_count > 0
+                                and abort_count >= self.config.max_error_count):
+                            stop_requested = True
                 finally:
                     if self.progress_callback:
                         self.progress_callback("update", len(group))
@@ -361,6 +378,41 @@ class TranslationWorker:
 # ---------------------------------------------------------------------------
 # 单本书翻译流程
 # ---------------------------------------------------------------------------
+def _do_retranslate(cache, elements, config):
+    """Clear translations for paragraphs matching retranslate range."""
+    import difflib
+    target_file = config.retranslate_file
+    start_text = config.retranslate_start
+    end_text = config.retranslate_end or ""
+
+    # Find paragraph IDs that match the file and text range
+    all_paras = cache.get_all_with_ignored()
+    matching_ids = []
+    in_range = False
+
+    for para in all_paras:
+        if target_file and para.page and target_file not in para.page:
+            continue
+        if start_text and start_text in para.original:
+            in_range = True
+        if in_range:
+            matching_ids.append(para.id)
+        if end_text and end_text in para.original and in_range:
+            in_range = False
+            break
+
+    if matching_ids:
+        cleared = cache.clear_translations(matching_ids)
+        logging.info("重翻译: 已清除 %d 段缓存 (匹配 %s)", cleared, target_file)
+        if sys.stderr.isatty():
+            print(
+                _c(f"  重翻译: 已清除 {cleared} 段缓存", _YELLOW),
+                file=sys.stderr,
+            )
+    else:
+        logging.warning("重翻译: 未找到匹配的段落 (file=%s, start=%s)", target_file, start_text)
+
+
 def translate_book(
     input_path: str,
     output_path: str,
@@ -385,9 +437,9 @@ def translate_book(
 
     def _status(msg):
         if book_pbar:
-            book_pbar.set_description(msg)
+            book_pbar.write(msg)
         elif overall_pbar:
-            overall_pbar.set_description(msg)
+            overall_pbar.write(msg)
 
     # --- 步骤 1: 获取 EPUB ---
     tmp_epub = None
@@ -405,7 +457,13 @@ def translate_book(
     # --- 步骤 2: 提取可翻译内容 ---
     _status(_c("提取文本内容", _CYAN))
     try:
-        elements, meta = extract_from_epub(working_epub)
+        elements, meta = extract_from_epub(
+            working_epub,
+            only_files=config.only_files,
+            exclude_files=config.exclude_files,
+            translate_tags=config.translate_tags,
+            exclude_translate_tags=config.exclude_translate_tags,
+        )
     except Exception as e:
         _err(f"EPUB 解析失败: {e}", book_pbar, overall_pbar)
         _cleanup(tmp_epub)
@@ -438,9 +496,18 @@ def translate_book(
     rows = build_cache_rows(elements)
     cache.save_paragraphs(rows)
 
+    # --- Retranslate mode: clear specific paragraph translations ---
+    if config.retranslate_file and config.retranslate_start:
+        _do_retranslate(cache, elements, config)
+
     untranslated = cache.get_untranslated()
     total = cache.total_count()
     already = cache.translated_count()
+
+    # --- Test mode: limit to first N paragraphs ---
+    if config.test_enabled and config.test_num > 0:
+        untranslated = untranslated[:config.test_num]
+        logging.info("测试模式: 仅翻译前 %d 段", config.test_num)
 
     # --- 步骤 4: 翻译 ---
     if untranslated:
@@ -510,11 +577,17 @@ def translate_book(
             title, total, done, failed, already, elapsed,
         )
         if failed > 0:
-            _err(f"{title}: {failed} 段翻译失败，已保留进度，未生成输出",
-                 book_pbar, overall_pbar)
-            cache.close()
-            _cleanup(tmp_epub)
-            return False
+            if config.skip_failed:
+                if book_pbar:
+                    book_pbar.write(
+                        _c(f"  ⚠ {title}: {failed} 段翻译失败，已跳过保留原文", _YELLOW))
+                logging.warning("%s: %d 段翻译失败，已跳过", title, failed)
+            else:
+                _err(f"{title}: {failed} 段翻译失败，已保留进度，未生成输出",
+                     book_pbar, overall_pbar)
+                cache.close()
+                _cleanup(tmp_epub)
+                return False
     else:
         if book_pbar:
             book_pbar.write(
@@ -528,11 +601,17 @@ def translate_book(
     all_paras = cache.get_all()
     missing = [p for p in all_paras if not p.translation]
     if missing:
-        _err(f"{title}: 仍有 {len(missing)} 段未翻译，未生成输出",
-             book_pbar, overall_pbar)
-        cache.close()
-        _cleanup(tmp_epub)
-        return False
+        if config.skip_failed:
+            for para in missing:
+                cache.update_translation(
+                    para.id, para.original, "skipped", config.target_lang)
+            logging.warning("%s: %d 段未翻译，已跳过保留原文", title, len(missing))
+        else:
+            _err(f"{title}: 仍有 {len(missing)} 段未翻译，未生成输出",
+                 book_pbar, overall_pbar)
+            cache.close()
+            _cleanup(tmp_epub)
+            return False
     trans_map = {p.id: p.translation for p in all_paras if p.translation}
 
     translated_epub = os.path.join(
@@ -543,6 +622,9 @@ def translate_book(
             working_epub, translated_epub, trans_map,
             position=config.translation_position,
             expected_count=len(trans_map),
+            style=config.translation_style,
+            translate_tags=config.translate_tags,
+            exclude_translate_tags=config.exclude_translate_tags,
         )
         logging.info("写入译文: %s, injected=%s", title, injected)
     except Exception as e:
@@ -721,7 +803,7 @@ def main(argv: list[str] | None = None):
         nonlocal interrupted
         if interrupted:
             print(_c("\n\n  强制退出", _RED), file=sys.stderr)
-            sys.exit(130)
+            os._exit(130)
         interrupted = True
         print(
             _c("\n\n  ⚠ 收到中断信号，正在保存进度...", _YELLOW),
@@ -881,12 +963,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="禁用翻译缓存 (不支持断点续翻)",
     )
     p.add_argument(
+        "--skip-failed", action="store_true",
+        help="跳过翻译失败的段落，保留原文继续生成输出",
+    )
+    p.add_argument(
         "--log-file", default="",
         help="日志输出到文件",
     )
     p.add_argument(
         "--dry-run", action="store_true",
         help="预览模式：仅列出待翻译的书籍",
+    )
+    p.add_argument(
+        "--test", action="store_true",
+        help="测试模式：仅翻译前几段",
+    )
+    p.add_argument(
+        "--test-num", type=int, default=0,
+        help="测试模式翻译段落数 (默认: 10)",
+    )
+    p.add_argument(
+        "--retranslate-file", default="",
+        help="重翻译的页面文件名",
+    )
+    p.add_argument(
+        "--retranslate-start", default="",
+        help="重翻译起始文本",
+    )
+    p.add_argument(
+        "--retranslate-end", default="",
+        help="重翻译结束文本",
     )
     p.add_argument(
         "--version", "-V", action="version",
@@ -910,7 +1016,19 @@ def _apply_overrides(args: argparse.Namespace) -> Config:
         config.engines[config.engine] = ecfg
     if args.no_cache:
         config.cache_enabled = False
+    if args.skip_failed:
+        config.skip_failed = True
     if args.log_file:
         config.log_file = args.log_file
+    if args.test:
+        config.test_enabled = True
+    if args.test_num > 0:
+        config.test_num = args.test_num
+    if args.retranslate_file:
+        config.retranslate_file = args.retranslate_file
+    if args.retranslate_start:
+        config.retranslate_start = args.retranslate_start
+    if args.retranslate_end:
+        config.retranslate_end = args.retranslate_end
 
     return config

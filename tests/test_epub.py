@@ -8,6 +8,7 @@ from lxml import etree
 
 from ebook_translator.epub import (
     _extract_text, _resolve_href, extract_from_epub, write_translated_epub,
+    _is_non_translatable,
 )
 
 
@@ -111,6 +112,87 @@ class EpubTests(unittest.TestCase):
         el = etree.fromstring("<p>He<em>l</em>lo &amp; bye</p>")
 
         self.assertEqual("Hello & bye", _extract_text(el))
+
+
+    def test_non_translatable_detects_urls_and_numbers(self):
+        self.assertTrue(_is_non_translatable("https://example.com"))
+        self.assertTrue(_is_non_translatable("http://foo.bar/path"))
+        self.assertTrue(_is_non_translatable("123,456.78"))
+        self.assertTrue(_is_non_translatable("99%"))
+        self.assertTrue(_is_non_translatable("ISBN: 978-0-13-468599-1"))
+        self.assertTrue(_is_non_translatable("Figure 3"))
+        self.assertTrue(_is_non_translatable("Table 1"))
+        self.assertTrue(_is_non_translatable("Source: data"))
+        self.assertTrue(_is_non_translatable(""))
+        self.assertFalse(_is_non_translatable("Hello world"))
+        self.assertFalse(_is_non_translatable("The quick brown fox"))
+
+    def test_translate_tags_restricts_extraction(self):
+        epub = self.tmp / "tags.epub"
+        make_epub(
+            epub,
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            "<p>paragraph</p><h1>heading</h1><blockquote>quote</blockquote>"
+            "</body></html>",
+        )
+        # Only extract <p> tags
+        elements, _ = extract_from_epub(str(epub), translate_tags="p")
+        self.assertEqual(1, len(elements))
+        self.assertEqual("paragraph", elements[0].original)
+
+    def test_exclude_translate_tags_skips_elements_with_children(self):
+        epub = self.tmp / "exclude.epub"
+        make_epub(
+            epub,
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            "<p>normal paragraph</p>"
+            "<p>has <code>code</code> inside</p>"
+            "<p>another normal</p>"
+            "</body></html>",
+        )
+        elements, _ = extract_from_epub(str(epub), exclude_translate_tags="code")
+        originals = [e.original for e in elements]
+        self.assertIn("normal paragraph", originals)
+        self.assertIn("another normal", originals)
+        self.assertNotIn("has code inside", originals)
+
+    def test_write_with_style_attribute(self):
+        epub = self.tmp / "style.epub"
+        make_epub(
+            epub,
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            "<p>Hello</p></body></html>",
+        )
+        elements, _ = extract_from_epub(str(epub))
+        self.assertEqual(1, len(elements))
+
+        out = self.tmp / "out.epub"
+        translations = {elements[0].uid: "你好"}
+        write_translated_epub(
+            str(epub), str(out), translations,
+            expected_count=1, style="color: blue; font-size: 12px",
+        )
+        with zipfile.ZipFile(out) as zf:
+            data = zf.read("c.xhtml").decode("utf-8")
+        self.assertIn("color: blue", data)
+        self.assertIn("et-translation", data)
+
+    def test_non_translatable_elements_marked_ignored(self):
+        epub = self.tmp / "ignored.epub"
+        make_epub(
+            epub,
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            "<p>https://example.com</p>"
+            "<p>Real text here</p>"
+            "<p>Figure 1</p>"
+            "</body></html>",
+        )
+        elements, _ = extract_from_epub(str(epub))
+        # Non-translatable should be excluded (not extracted at all)
+        originals = [e.original for e in elements]
+        self.assertIn("Real text here", originals)
+        self.assertNotIn("https://example.com", originals)
+        self.assertNotIn("Figure 1", originals)
 
 
 if __name__ == "__main__":

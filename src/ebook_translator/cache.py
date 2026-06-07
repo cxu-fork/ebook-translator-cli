@@ -125,6 +125,20 @@ class TranslationCache:
             )
             self.conn.commit()
 
+    def clear_translations(self, ids: list[str]) -> int:
+        """Clear cached translations for the given paragraph ids."""
+        if not ids:
+            return 0
+        with self._lock:
+            before = self.conn.total_changes
+            self.conn.executemany(
+                "UPDATE cache SET translation=NULL, engine_name=NULL, "
+                "target_lang=NULL WHERE id=?",
+                [(pid,) for pid in ids],
+            )
+            self.conn.commit()
+            return self.conn.total_changes - before
+
     def translated_count(self) -> int:
         cur = self.conn.execute(
             "SELECT COUNT(*) FROM cache WHERE NOT ignored AND translation IS NOT NULL"

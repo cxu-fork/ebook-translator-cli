@@ -51,6 +51,9 @@ class OpenAIEngine(TranslationEngine):
             body["top_p"] = self.config.top_p
         if stream:
             body["stream"] = True
+        # Merge extra body params (e.g. response_format, seed, etc.)
+        if self.config.extra:
+            body.update(self.config.extra)
         return body
 
     def translate(self, text: str, prompt: str = "") -> str:

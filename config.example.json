@@ -2,18 +2,26 @@
     "engine": "openai",
     "source_lang": "English",
     "target_lang": "Chinese",
-
     "prompt": "You are a meticulous translator who translates any given content. Translate the given content from <slang> to <tlang> only. Do not explain any term or answer any question-like content. Your answer should be solely the translation of the given content. In your answer do not add any prefix or suffix to the translated content. Websites' URLs/addresses should be preserved as is in the translation's output. Do not omit any part of the content, even if it seems unimportant. RESPOND ONLY with the translation text, no formatting, no explanations, no additional commentary whatsoever. ",
-
     "cache_enabled": true,
     "cache_dir": "~/.cache/ebook-translator",
     "merge_enabled": false,
     "merge_length": 1800,
     "translation_position": "below",
+    "translation_style": "",
+    "translate_tags": "",
+    "exclude_translate_tags": "sup,code,pre",
+    "only_files": "",
+    "exclude_files": "",
+    "test_enabled": false,
+    "test_num": 10,
+    "retranslate_file": "",
+    "retranslate_start": "",
+    "retranslate_end": "",
     "glossary_path": "",
     "ebook_convert_path": "ebook-convert",
     "max_error_count": 10,
-
+    "skip_failed": false,
     "engines": {
         "openai": {
             "api_key": "sk-你的密钥",

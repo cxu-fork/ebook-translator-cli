@@ -55,9 +55,20 @@ class Config:
     merge_enabled: bool = False
     merge_length: int = 1800
     translation_position: str = "below"  # below, above, only
+    translation_style: str = ""
+    translate_tags: str = ""
+    exclude_translate_tags: str = "sup,code,pre"
+    only_files: str = ""
+    exclude_files: str = ""
+    test_enabled: bool = False
+    test_num: int = 10
+    retranslate_file: str = ""
+    retranslate_start: str = ""
+    retranslate_end: str = ""
     glossary_path: str = ""
     ebook_convert_path: str = "ebook-convert"
     max_error_count: int = 10
+    skip_failed: bool = False
     log_file: str = ""
     engines: dict[str, EngineConfig] = field(default_factory=dict)
 
@@ -91,8 +102,11 @@ def load_config(path: str | Path | None) -> Config:
     for top_key in (
         "engine", "source_lang", "target_lang", "prompt",
         "cache_enabled", "cache_dir", "merge_enabled", "merge_length",
-        "translation_position", "glossary_path", "ebook_convert_path",
-        "max_error_count", "log_file",
+        "translation_position", "translation_style", "translate_tags",
+        "exclude_translate_tags", "only_files", "exclude_files",
+        "test_enabled", "test_num", "retranslate_file", "retranslate_start",
+        "retranslate_end", "glossary_path", "ebook_convert_path",
+        "max_error_count", "skip_failed", "log_file",
     ):
         if top_key in raw:
             setattr(cfg, top_key, raw[top_key])
