@@ -91,12 +91,27 @@ def _build_engine(raw: dict) -> EngineConfig:
 
 
 def load_config(path: str | Path | None) -> Config:
-    """Load config from a JSON file, falling back to defaults."""
+    """Load config from a JSON file, falling back to defaults.
+
+    If *path* is not given (empty/None), automatically looks for
+    ``config.json`` next to the running executable (frozen) or in the
+    current working directory (development).
+    """
     raw: dict[str, Any] = {}
     if path:
         p = Path(path)
         if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
+    else:
+        # Auto-discover config.json
+        import sys
+        candidates = [Path("config.json")]
+        if getattr(sys, "frozen", False):
+            candidates.insert(0, Path(sys.executable).parent / "config.json")
+        for candidate in candidates:
+            if candidate.is_file():
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+                break
 
     cfg = Config()
     for top_key in (
