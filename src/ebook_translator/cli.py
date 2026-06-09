@@ -363,9 +363,8 @@ class TranslationWorker:
                 finally:
                     if self.progress_callback:
                         self.progress_callback("update", len(group))
-            # Rate-limit outside the semaphore so it doesn't block other tasks
-            if interval > 0:
-                await asyncio.sleep(interval)
+                if interval > 0:
+                    await asyncio.sleep(interval)
 
         try:
             tasks = [translate_group(group) for group in groups]

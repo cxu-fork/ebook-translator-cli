@@ -1,6 +1,7 @@
 import json
 import shutil
 import tempfile
+import time
 import unittest
 import zipfile
 import asyncio
@@ -299,7 +300,7 @@ class CliTests(unittest.TestCase):
         epub = self.tmp / "test_auto.epub"
         out = self.tmp / "out.epub"
         make_epub(epub, ["one", "two", "three"])
-        
+
         class Args:
             config = ""
             engine = ""
@@ -328,6 +329,34 @@ class CliTests(unittest.TestCase):
             data = zf.read("c.xhtml").decode("utf-8")
         self.assertIn("译文 one", data)
         self.assertIn("two", data)
+
+    def test_request_interval_applies_between_requests(self):
+        starts = []
+
+        class TimedEngine:
+            def translate(self, text: str, prompt: str = "") -> str:
+                starts.append(time.monotonic())
+                return f"译文 {text}"
+
+        cache = TranslationCache(str(self.tmp / "interval.db"))
+        paras = [Para(str(i), f"text {i}") for i in range(3)]
+        cache.save_paragraphs([
+            (p.id, p.id, "", p.original, False, None, None) for p in paras
+        ])
+        cfg = Config(engine="openai", max_error_count=10)
+        cfg.engines["openai"] = EngineConfig(
+            api_key="x", max_retries=1, request_interval=0,
+        )
+        worker = cli.TranslationWorker(
+            TimedEngine(), cache, cfg, cli.Glossary(""))
+
+        asyncio.run(worker.translate_batch(
+            paras, concurrency=1, interval=0.03))
+
+        cache.close()
+        gaps = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+        self.assertEqual(2, len(gaps))
+        self.assertTrue(all(gap >= 0.025 for gap in gaps), gaps)
 
 
 if __name__ == "__main__":
