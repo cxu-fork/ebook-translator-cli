@@ -102,6 +102,11 @@ def load_config(path: str | Path | None) -> Config:
         p = Path(path)
         if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
+        else:
+            raise FileNotFoundError(
+                f"配置文件不存在: {p.resolve()}"
+                f" 请确认路径正确，或从包含 config.json 的目录运行"
+            )
     else:
         # Auto-discover config.json
         import sys
