@@ -1,12 +1,12 @@
 """翻译引擎注册表。"""
 from .base import TranslationEngine
-from .openai_engine import OpenAIEngine
+from .openai_engine import DeepSeekEngine, OpenAIEngine
 from .anthropic_engine import AnthropicEngine
 
 ENGINE_REGISTRY: dict[str, type[TranslationEngine]] = {
     "openai": OpenAIEngine,
     "claude": AnthropicEngine,
-    "deepseek": OpenAIEngine,  # DeepSeek 使用 OpenAI 兼容 API
+    "deepseek": DeepSeekEngine,
 }
 
 

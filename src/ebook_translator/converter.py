@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 
 class ConverterError(Exception):
@@ -20,9 +21,6 @@ def _kindleunpack_to_epub(input_path: str, output_path: str) -> str:
     tmp_dir = tempfile.mkdtemp(prefix="ku_")
     try:
         unpackBook(input_path, tmp_dir, epubver='2', use_hd=False)
-        # KindleUnpack 输出到 tmp_dir/<书名>/ 目录下
-        subdirs = [d for d in os.listdir(tmp_dir)
-                   if os.path.isdir(os.path.join(tmp_dir, d))]
         # 找到生成的 EPUB 文件
         epub_file = None
         for root, _dirs, files in os.walk(tmp_dir):
@@ -38,8 +36,17 @@ def _kindleunpack_to_epub(input_path: str, output_path: str) -> str:
             epub_file = _repack_epub_from_dir(tmp_dir)
         if epub_file is None:
             raise ConverterError("KindleUnpack 未能生成 EPUB 文件")
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        shutil.copy2(epub_file, output_path)
+        output_dir = os.path.dirname(output_path) or "."
+        os.makedirs(output_dir, exist_ok=True)
+        fd, tmp_output = tempfile.mkstemp(
+            prefix=".et-kindle-", suffix=".epub", dir=output_dir)
+        os.close(fd)
+        try:
+            shutil.copy2(epub_file, tmp_output)
+            os.replace(tmp_output, output_path)
+        finally:
+            if os.path.exists(tmp_output):
+                os.remove(tmp_output)
         return output_path
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -50,7 +57,7 @@ def _repack_epub_from_dir(base_dir: str) -> str | None:
     import zipfile
 
     opf_path = None
-    for root, dirs, files in os.walk(base_dir):
+    for root, _dirs, files in os.walk(base_dir):
         if 'content.opf' in files:
             opf_path = os.path.join(root, 'content.opf')
             break
@@ -89,7 +96,7 @@ def _repack_epub_from_dir(base_dir: str) -> str | None:
     container_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
-        f'<rootfiles><rootfile full-path="{opf_full_path}" '
+        f'<rootfiles><rootfile full-path={quoteattr(opf_full_path)} '
         'media-type="application/oebps-package+xml"/>'
         '</rootfiles></container>'
     )
@@ -101,9 +108,11 @@ def _repack_epub_from_dir(base_dir: str) -> str | None:
         # META-INF/container.xml
         zf.writestr("META-INF/container.xml", container_xml)
         # 书的所有文件
-        for root, dirs, files in os.walk(epub_root):
+        for root, _dirs, files in os.walk(epub_root):
             for f in files:
                 full = os.path.join(root, f)
+                if os.path.abspath(full) == os.path.abspath(epub_path):
+                    continue
                 arcname = os.path.relpath(full, epub_root).replace(os.sep, "/")
                 if arcname in {"mimetype", "META-INF/container.xml"}:
                     continue
@@ -122,8 +131,14 @@ _INSTALL_HINT = """\
 
 
 def find_ebook_convert(custom_path: str = "") -> str:
-    if custom_path and os.path.isfile(custom_path):
-        return custom_path
+    if custom_path:
+        if os.path.isfile(custom_path):
+            return custom_path
+        if os.path.basename(custom_path) == custom_path:
+            found = shutil.which(custom_path)
+            if found:
+                return found
+        raise ConverterError(f"配置的 ebook-convert 路径无效: {custom_path}")
     found = shutil.which("ebook-convert")
     if found:
         return found
@@ -148,24 +163,35 @@ def find_ebook_convert(custom_path: str = "") -> str:
 def _ebook_convert(input_path: str, output_path: str, output_format: str,
                    ebook_convert_path: str = "") -> str:
     binary = find_ebook_convert(ebook_convert_path)
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    cmd = [binary, input_path, output_path]
+    out_dir = os.path.dirname(output_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    suffix = Path(output_path).suffix or f".{output_format}"
+    fd, tmp_output = tempfile.mkstemp(
+        prefix=".et-", suffix=suffix, dir=out_dir)
+    os.close(fd)
+    os.remove(tmp_output)
+    cmd = [binary, input_path, tmp_output]
     if output_format in ("epub", "mobi", "azw3"):
         cmd.extend(["--enable-heuristics"])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        raise ConverterError(f"ebook-convert 超时 (300秒): {input_path}")
-    if result.returncode != 0:
-        raise ConverterError(
-            f"ebook-convert 失败 (返回码 {result.returncode}):\n"
-            f"{result.stderr[-2000:]}"
-        )
-    if not os.path.isfile(output_path):
-        raise ConverterError(f"ebook-convert 未生成输出文件: {output_path}")
-    return output_path
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise ConverterError(f"ebook-convert 超时 (300秒): {input_path}")
+        except OSError as e:
+            raise ConverterError(f"无法运行 ebook-convert: {e}") from e
+        if result.returncode != 0:
+            raise ConverterError(
+                f"ebook-convert 失败 (返回码 {result.returncode}):\n"
+                f"{result.stderr[-2000:]}"
+            )
+        if not os.path.isfile(tmp_output):
+            raise ConverterError(f"ebook-convert 未生成输出文件: {output_path}")
+        os.replace(tmp_output, output_path)
+        return output_path
+    finally:
+        if os.path.exists(tmp_output):
+            os.remove(tmp_output)
 
 
 # ---------------------------------------------------------------------------

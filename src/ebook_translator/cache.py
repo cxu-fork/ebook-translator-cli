@@ -4,7 +4,6 @@ import os
 import sqlite3
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 
 @dataclass
@@ -31,7 +30,6 @@ class TranslationCache:
 
     def __init__(self, db_path: str, persistence: bool = True):
         self.db_path = db_path
-        self.persistence = persistence
         self._lock = threading.Lock()
         if persistence:
             db_dir = os.path.dirname(db_path)
@@ -94,7 +92,7 @@ class TranslationCache:
         cur = self.conn.execute(
             "SELECT id, md5, raw, original, ignored, attributes, page, "
             "translation, engine_name, target_lang "
-            "FROM cache WHERE NOT ignored AND translation IS NULL"
+            "FROM cache WHERE NOT ignored AND translation IS NULL ORDER BY rowid"
         )
         return [Paragraph(*row) for row in cur.fetchall()]
 
@@ -103,7 +101,7 @@ class TranslationCache:
         cur = self.conn.execute(
             "SELECT id, md5, raw, original, ignored, attributes, page, "
             "translation, engine_name, target_lang "
-            "FROM cache WHERE NOT ignored"
+            "FROM cache WHERE NOT ignored ORDER BY rowid"
         )
         return [Paragraph(*row) for row in cur.fetchall()]
 
@@ -111,19 +109,32 @@ class TranslationCache:
         """Return all paragraphs including ignored ones."""
         cur = self.conn.execute(
             "SELECT id, md5, raw, original, ignored, attributes, page, "
-            "translation, engine_name, target_lang FROM cache"
+            "translation, engine_name, target_lang FROM cache ORDER BY rowid"
         )
         return [Paragraph(*row) for row in cur.fetchall()]
 
     def update_translation(self, pid: str, translation: str,
                            engine_name: str, target_lang: str):
+        self.update_translations([(pid, translation, engine_name, target_lang)])
+
+    def update_translations(self, translations: list[tuple[str, str, str, str]]):
+        """Update multiple translations in one transaction."""
+        if not translations:
+            return
         with self._lock:
-            self.conn.execute(
-                "UPDATE cache SET translation=?, engine_name=?, target_lang=? "
-                "WHERE id=?",
-                (translation, engine_name, target_lang, pid),
-            )
-            self.conn.commit()
+            try:
+                self.conn.executemany(
+                    "UPDATE cache SET translation=?, engine_name=?, target_lang=? "
+                    "WHERE id=?",
+                    [
+                        (translation, engine_name, target_lang, pid)
+                        for pid, translation, engine_name, target_lang in translations
+                    ],
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def clear_translations(self, ids: list[str]) -> int:
         """Clear cached translations for the given paragraph ids."""

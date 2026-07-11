@@ -12,11 +12,9 @@ import os
 try:
     # Pre-Python 3.13 (before imghdr was removed)
     import imghdr
-    print('KindleUnpack is using the built-in python imghdr module')
 except ImportError:
     # Python 3.13+ (after imghdr was removed)
     from . import imghdr
-    print('KindleUnpack is using the bundled imghdr module')
 
 import struct
 # note:  struct pack, unpack, unpack_from all require bytestring format

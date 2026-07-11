@@ -2,19 +2,28 @@
 import argparse
 import asyncio
 import concurrent.futures
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
+import httpx
+
 from . import __version__
 from .cache import TranslationCache, md5
-from .config import Config, load_config, SUPPORTED_INPUT_FORMATS, NATIVE_FORMATS
+from .config import (
+    Config, MAX_CONCURRENCY, NATIVE_FORMATS, SUPPORTED_INPUT_FORMATS, load_config,
+)
 from .converter import convert, convert_to_epub, ConverterError
 from .engines import get_engine
 from .engines.base import TranslationEngine
@@ -31,7 +40,6 @@ _DIM = "\033[2m"
 _RED = "\033[31m"
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
-_BLUE = "\033[34m"
 _CYAN = "\033[36m"
 
 def _c(text: str, *codes: str) -> str:
@@ -56,9 +64,27 @@ def _err(msg, *pbars):
     print(line, file=sys.stderr)
 
 
-def _is_permanent_translation_error(exc: Exception) -> bool:
+# 错误分类：决定重试次数与退避策略
+_ERR_PERMANENT = "permanent"
+_ERR_RATE_LIMIT = "rate_limit"
+_ERR_EMPTY = "empty"
+_ERR_TRANSIENT = "transient"
+
+# 空译文通常是模型/代理拒写，多打几次往往无用
+_EMPTY_MAX_ATTEMPTS = 2
+
+
+def _classify_translation_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429:
+            return _ERR_RATE_LIMIT
+        if 400 <= status < 500 and status not in {408, 409, 425}:
+            return _ERR_PERMANENT
     text = str(exc).lower()
-    needles = (
+    if isinstance(exc, ValueError) and "不能覆盖保留字段" in text:
+        return _ERR_PERMANENT
+    permanent_needles = (
         "401",
         "403",
         "unauthorized",
@@ -69,8 +95,66 @@ def _is_permanent_translation_error(exc: Exception) -> bool:
         "api 密钥无效",
         "密钥无效",
         "已过期",
+        "输出被截断",
+        "内容过滤",
+        "content_filter",
+        "stop_reason=max_tokens",
+        "stop_reason=refusal",
     )
-    return any(needle in text for needle in needles)
+    if any(n in text for n in permanent_needles):
+        return _ERR_PERMANENT
+    if "429" in text or "频率超限" in text or "too many" in text or "rate limit" in text:
+        return _ERR_RATE_LIMIT
+    if "空译文" in text or "空结果" in text or "empty" in text:
+        return _ERR_EMPTY
+    return _ERR_TRANSIENT
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    value = response.headers.get("Retry-After") if response is not None else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+class _BatchStopped(Exception):
+    pass
+
+
+class _RateLimiter:
+    """Thread-safe request-start limiter shared by all translation calls."""
+
+    def __init__(self, interval: float):
+        self.interval = max(0.0, float(interval or 0.0))
+        self._lock = threading.Lock()
+        self._next_time = 0.0
+
+    def acquire(self, stop_event: threading.Event):
+        while True:
+            if stop_event.is_set():
+                raise _BatchStopped()
+            with self._lock:
+                now = time.monotonic()
+                wait = self._next_time - now
+                if wait <= 0:
+                    self._next_time = now + self.interval
+                    return
+            if stop_event.wait(wait):
+                raise _BatchStopped()
+
+    def defer(self, seconds: float):
+        with self._lock:
+            self._next_time = max(
+                self._next_time, time.monotonic() + max(0.0, seconds))
 
 
 # 术语表
@@ -78,8 +162,23 @@ def _is_permanent_translation_error(exc: Exception) -> bool:
 class Glossary:
     def __init__(self, path: str = ""):
         self.pairs: list[tuple[str, str]] = []
-        if path and os.path.isfile(path):
+        if path:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"术语表文件不存在: {Path(path).resolve()}")
             self._load(path)
+        self._source_ids: dict[str, int] = {}
+        for i, (src, _tgt) in enumerate(self.pairs):
+            self._source_ids.setdefault(src, i)
+        digest = hashlib.sha256(json.dumps(
+            self.pairs, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()[:12]
+        self._tokens = [
+            f"{{{{etg_{digest}_{i:06d}}}}}" for i in range(len(self.pairs))
+        ]
+        self._source_pattern = (
+            re.compile("|".join(re.escape(src) for src in self._source_ids))
+            if self._source_ids else None
+        )
 
     def _load(self, path: str):
         content = Path(path).read_text(encoding="utf-8-sig").strip()
@@ -99,13 +198,17 @@ class Glossary:
         self.pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
     def apply(self, text: str) -> str:
-        for i, (src, _tgt) in enumerate(self.pairs):
-            text = text.replace(src, f"{{{{id_{i:06d}}}}}")
-        return text
+        if self._source_pattern is None:
+            return text
+        return self._source_pattern.sub(
+            lambda match: self._tokens[self._source_ids[match.group(0)]],
+            text,
+        )
 
     def restore(self, text: str) -> str:
         for i, (_src, tgt) in enumerate(self.pairs):
-            pattern = r"\{\{\s*" + re.escape(f"id_{i:06d}") + r"\s*\}\}"
+            token = self._tokens[i][2:-2]
+            pattern = r"\{\{\s*" + re.escape(token) + r"\s*\}\}"
             text = re.sub(pattern, lambda _m, value=tgt: value, text)
         return text
 
@@ -126,8 +229,10 @@ def _build_cache_key(input_path: str, elements: list, config: Config,
         ensure_ascii=False,
         separators=(",", ":"),
     ))
+    # merge_enabled / merge_length only affect request batching, not translation
+    # identity. Keep them out so batching changes reuse per-paragraph progress.
     payload = {
-        "cache_version": 3,
+        "cache_version": 4,
         "source_content_md5": _file_md5(input_path),
         "element_signature": element_sig,
         "engine": config.engine,
@@ -136,11 +241,11 @@ def _build_cache_key(input_path: str, elements: list, config: Config,
         "prompt": config.prompt,
         "model": engine_cfg.model,
         "base_url": engine_cfg.base_url,
-        "merge_enabled": config.merge_enabled,
-        "merge_length": config.merge_length,
+        "temperature": engine_cfg.temperature,
+        "top_p": engine_cfg.top_p,
+        "extra": engine_cfg.extra,
         "translate_tags": config.translate_tags,
         "exclude_translate_tags": config.exclude_translate_tags,
-        "translation_style": config.translation_style,
         "glossary": glossary.pairs,
     }
     return md5(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -164,17 +269,27 @@ class TranslationWorker:
         self.glossary = glossary
         self.abort_count = 0
         self.progress_callback = progress_callback
-        import threading
         self._abort_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._rate_limiter = _RateLimiter(0)
+
+    def _max_attempts_for(self, kind: str, configured: int) -> int:
+        configured = max(1, int(configured or 1))
+        if kind == _ERR_PERMANENT:
+            return 1
+        if kind == _ERR_EMPTY:
+            return min(configured, _EMPTY_MAX_ATTEMPTS)
+        return configured
 
     def _translate_one(self, text: str, prompt: str | None = None) -> str:
         import random
         engine_cfg = self.config.get_engine()
-        max_retries = engine_cfg.max_retries
+        max_retries = max(1, int(engine_cfg.max_retries or 1))
         retry_delay = engine_cfg.retry_delay
         prompt = prompt if prompt is not None else self.config.prompt
 
         for attempt in range(1, max_retries + 1):
+            self._rate_limiter.acquire(self._stop_event)
             try:
                 result = self.engine.translate(text, prompt=prompt)
                 if not result or not result.strip():
@@ -183,22 +298,37 @@ class TranslationWorker:
                     self.abort_count = 0
                 return result
             except Exception as e:
-                if _is_permanent_translation_error(e):
+                kind = _classify_translation_error(e)
+                if kind == _ERR_PERMANENT:
                     raise
-                if attempt < max_retries:
-                    # 429: 用更长的退避
-                    err_str = str(e)
-                    is_429 = "429" in err_str or "频率超限" in err_str or "Too many" in err_str
-                    base = retry_delay * (2 if is_429 else 1) * attempt
+                allowed = self._max_attempts_for(kind, max_retries)
+                if attempt < allowed:
+                    server_wait = None
+                    if kind == _ERR_RATE_LIMIT:
+                        retry_after = _retry_after_seconds(e)
+                        if retry_after is not None:
+                            self._rate_limiter.defer(retry_after)
+                            server_wait = retry_after
+                            base = 0
+                        else:
+                            base = retry_delay * 2 * attempt
+                        tag = "限流"
+                    elif kind == _ERR_EMPTY:
+                        # 空译文短退避，避免白等
+                        base = min(retry_delay, 2.0) * attempt
+                        tag = "空译文"
+                    else:
+                        base = retry_delay * attempt
+                        tag = "重试"
                     jitter = random.uniform(0.5, 1.5)
-                    wait = base * jitter
+                    wait = server_wait if server_wait is not None else base * jitter
                     if self.progress_callback:
-                        tag = "限流" if is_429 else "重试"
                         self.progress_callback(
                             "desc",
-                            _c(f"{tag} {attempt}/{max_retries} ({wait:.0f}s)", _YELLOW),
+                            _c(f"{tag} {attempt}/{allowed} ({wait:.0f}s)", _YELLOW),
                         )
-                    time.sleep(wait)
+                    if self._stop_event.wait(wait):
+                        raise _BatchStopped()
                 else:
                     raise
 
@@ -249,14 +379,19 @@ class TranslationWorker:
             elif isinstance(data.get("translations"), list):
                 data = data["translations"]
             else:
-                result = {str(k): str(v) for k, v in data.items()}
+                for key, value in data.items():
+                    if not isinstance(value, str):
+                        raise ValueError("合并翻译返回的译文必须是字符串")
+                    result[str(key)] = value
         if isinstance(data, list):
             for item in data:
                 if not isinstance(item, dict):
                     raise ValueError("合并翻译返回的数组元素不是对象")
                 sid = str(item.get("id", ""))
                 value = item.get("text", item.get("translation", ""))
-                result[sid] = str(value)
+                if not isinstance(value, str):
+                    raise ValueError("合并翻译返回的译文必须是字符串")
+                result[sid] = value
 
         if set(result) != expected_ids:
             raise ValueError("合并翻译返回的 segment id 不完整")
@@ -279,16 +414,10 @@ class TranslationWorker:
         payload = json.dumps(segments, ensure_ascii=False)
         expected_ids = {str(i) for i in range(len(group))}
 
+        response = self._translate_one(payload, prompt=self._merge_prompt())
         try:
-            response = self._translate_one(payload, prompt=self._merge_prompt())
             merged = self._parse_merged_result(response, expected_ids)
-            return {
-                para.id: self.glossary.restore(merged[str(i)]).strip()
-                for i, para in enumerate(group)
-            }
-        except Exception as e:
-            if _is_permanent_translation_error(e):
-                raise
+        except (json.JSONDecodeError, ValueError) as e:
             logging.warning("合并翻译解析失败，回退逐段: %s", e)
             fallback: dict[str, str] = {}
             for para in group:
@@ -296,20 +425,31 @@ class TranslationWorker:
                 result = self._translate_one(text)
                 fallback[para.id] = self.glossary.restore(result).strip()
             return fallback
+        return {
+            para.id: self.glossary.restore(merged[str(i)]).strip()
+            for i, para in enumerate(group)
+        }
 
     async def translate_batch(self, paragraphs: list, concurrency: int = 3,
                               interval: float = 1.0):
-        _MAX_CONCURRENCY = 32
-        concurrency = max(1, min(int(concurrency or 1), _MAX_CONCURRENCY))
+        concurrency = max(1, min(int(concurrency or 1), MAX_CONCURRENCY))
         sem = asyncio.Semaphore(concurrency)
         done_count = 0
         failed_count = 0
-        stop_event = asyncio.Event()
+        self._stop_event = threading.Event()
+        self._rate_limiter = _RateLimiter(interval)
+        stop_event = self._stop_event
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
         groups = self._merge_groups(paragraphs)
 
         async def translate_group(group):
             nonlocal done_count, failed_count
+            if stop_event.is_set():
+                failed_count += len(group)
+                if self.progress_callback:
+                    self.progress_callback("update", len(group))
+                return
+
             async with sem:
                 if stop_event.is_set():
                     failed_count += len(group)
@@ -321,25 +461,24 @@ class TranslationWorker:
                     result_map = await loop.run_in_executor(
                         executor, self._translate_group, group
                     )
+                    updates = []
                     for para in group:
                         result = result_map.get(para.id, "").strip()
                         if not result:
                             raise RuntimeError("API 返回空译文")
-                        self.cache.update_translation(
+                        updates.append((
                             para.id, result,
                             self.config.engine, self.config.target_lang,
-                        )
-                        done_count += 1
+                        ))
+                    self.cache.update_translations(updates)
+                    done_count += len(group)
                     with self._abort_lock:
                         self.abort_count = 0
+                except _BatchStopped:
+                    failed_count += len(group)
                 except Exception as e:
                     if self.config.skip_failed:
-                        for para in group:
-                            self.cache.update_translation(
-                                para.id, para.original,
-                                "skipped", self.config.target_lang,
-                            )
-                            done_count += 1
+                        failed_count += len(group)
                         if self.progress_callback:
                             sample = group[0].original if group else ""
                             self.progress_callback(
@@ -363,8 +502,6 @@ class TranslationWorker:
                 finally:
                     if self.progress_callback:
                         self.progress_callback("update", len(group))
-                if interval > 0:
-                    await asyncio.sleep(interval)
 
         try:
             tasks = [translate_group(group) for group in groups]
@@ -378,14 +515,14 @@ class TranslationWorker:
                     )
             return done_count, failed_count
         finally:
+            stop_event.set()
             executor.shutdown(wait=True)
 
 # ---------------------------------------------------------------------------
 # 单本书翻译流程
 # ---------------------------------------------------------------------------
-def _do_retranslate(cache, elements, config):
+def _do_retranslate(cache, config):
     """Clear translations for paragraphs matching retranslate range."""
-    import difflib
     target_file = config.retranslate_file
     start_text = config.retranslate_start
     end_text = config.retranslate_end or ""
@@ -396,8 +533,11 @@ def _do_retranslate(cache, elements, config):
     in_range = False
 
     for para in all_paras:
-        if target_file and (not para.page or target_file not in para.page):
-            continue
+        if target_file:
+            if not para.page:
+                continue
+            if target_file not in {para.page, Path(para.page).name}:
+                continue
         if start_text and start_text in para.original:
             in_range = True
         if in_range:
@@ -503,7 +643,7 @@ def translate_book(
 
     # --- Retranslate mode: clear specific paragraph translations ---
     if config.retranslate_file and config.retranslate_start:
-        _do_retranslate(cache, elements, config)
+        _do_retranslate(cache, config)
 
     untranslated = cache.get_untranslated()
     total = cache.total_count()
@@ -516,9 +656,9 @@ def translate_book(
 
     # --- 步骤 4: 翻译 ---
     if untranslated:
-        engine_cls = get_engine(config.engine)
-        engine_cfg = config.get_engine()
         try:
+            engine_cls = get_engine(config.engine)
+            engine_cfg = config.get_engine()
             engine = engine_cls(engine_cfg, config.source_lang, config.target_lang)
         except ValueError as e:
             _err(f"引擎初始化失败: {e}", book_pbar, overall_pbar)
@@ -560,11 +700,16 @@ def translate_book(
             done, failed = asyncio.run(
                 worker.translate_batch(untranslated, concurrency, interval)
             )
-        except (RuntimeError, KeyboardInterrupt) as e:
+        except (RuntimeError, KeyboardInterrupt):
             trans_pbar.close()
             cache.close()
             _cleanup(tmp_epub)
             raise
+        finally:
+            try:
+                engine.close()
+            except Exception:
+                pass
 
         elapsed = time.time() - start
         trans_pbar.close()
@@ -607,10 +752,7 @@ def translate_book(
     missing = [p for p in all_paras if not p.translation]
     if missing:
         if config.skip_failed:
-            for para in missing:
-                cache.update_translation(
-                    para.id, para.original, "skipped", config.target_lang)
-            logging.warning("%s: %d 段未翻译，已跳过保留原文", title, len(missing))
+            logging.warning("%s: %d 段未翻译，本次输出保留原文", title, len(missing))
         else:
             _err(f"{title}: 仍有 {len(missing)} 段未翻译，未生成输出",
                  book_pbar, overall_pbar)
@@ -619,9 +761,11 @@ def translate_book(
             return False
     trans_map = {p.id: p.translation for p in all_paras if p.translation}
 
-    translated_epub = os.path.join(
-        os.path.dirname(output_path) or ".", f".{book_name}_translated.epub"
-    )
+    output_dir = os.path.dirname(output_path) or "."
+    fd, translated_epub = tempfile.mkstemp(
+        prefix=f".{book_name}_", suffix=".epub", dir=output_dir)
+    os.close(fd)
+    os.remove(translated_epub)
     try:
         injected = write_translated_epub(
             working_epub, translated_epub, trans_map,
@@ -648,9 +792,14 @@ def translate_book(
             convert(translated_epub, final_path, output_format,
                     config.ebook_convert_path)
         except ConverterError as e:
-            import shutil
-            fallback = output_path.rsplit(".", 1)[0] + ".epub"
-            shutil.move(translated_epub, fallback)
+            base = output_path.rsplit(".", 1)[0]
+            fallback = base + ".translated.epub"
+            suffix = 2
+            while (os.path.exists(fallback)
+                   or os.path.abspath(fallback) == os.path.abspath(input_path)):
+                fallback = f"{base}.translated-{suffix}.epub"
+                suffix += 1
+            os.replace(translated_epub, fallback)
             _err(f"输出转换失败({e})，已回退保存为 EPUB: {fallback}",
                  book_pbar, overall_pbar)
             cache.close()
@@ -659,8 +808,7 @@ def translate_book(
         if os.path.exists(translated_epub):
             os.remove(translated_epub)
     else:
-        import shutil
-        shutil.move(translated_epub, final_path)
+        os.replace(translated_epub, final_path)
 
     cache.close()
     _cleanup(tmp_epub)
@@ -669,14 +817,15 @@ def translate_book(
 
 
 def _cleanup(tmp_epub):
-    if tmp_epub and os.path.exists(tmp_epub):
-        try:
-            os.remove(tmp_epub)
-            tmp_dir = os.path.dirname(tmp_epub)
-            if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
-                os.rmdir(tmp_dir)
-        except OSError:
-            pass
+    if tmp_epub:
+        tmp_dir = os.path.dirname(tmp_epub)
+        if os.path.basename(tmp_dir).startswith("et_epub_"):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        else:
+            try:
+                os.remove(tmp_epub)
+            except FileNotFoundError:
+                pass
 
 # ---------------------------------------------------------------------------
 # 收集待翻译书籍
@@ -727,7 +876,11 @@ def main(argv: list[str] | None = None):
     from tqdm import tqdm
 
     args = _parse_args(argv)
-    config = _apply_overrides(args)
+    try:
+        config = _apply_overrides(args)
+    except (OSError, ValueError, TypeError) as e:
+        print(_c("配置错误: ", _RED) + str(e), file=sys.stderr)
+        raise SystemExit(2) from e
 
     # 设置日志
     if config.log_file:
@@ -761,6 +914,7 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
     logging.info("找到 %s 本书", len(books))
 
+    output_format = args.output_format.lower()
     # 预览模式
     if args.dry_run:
         print(_c(f"\n找到 {len(books)} 本书:\n", _BOLD))
@@ -770,6 +924,26 @@ def main(argv: list[str] | None = None):
         print()
         return
 
+    output_paths: dict[str, str] = {}
+    for book in books:
+        out_path = os.path.realpath(
+            os.path.join(args.output, f"{Path(book).stem}.{output_format}")
+        )
+        if out_path in output_paths:
+            print(
+                _c("错误: ", _RED)
+                + f"输入文件输出名冲突: {output_paths[out_path]} 和 {book}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if os.path.realpath(book) == out_path:
+            print(
+                _c("错误: ", _RED) + f"拒绝覆盖输入文件: {book}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        output_paths[out_path] = book
+
     # 检查输出目录
     os.makedirs(args.output, exist_ok=True)
     if not os.access(args.output, os.W_OK):
@@ -778,13 +952,16 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
 
     # 加载术语表
-    glossary = Glossary(config.glossary_path)
+    try:
+        glossary = Glossary(config.glossary_path)
+    except OSError as e:
+        print(_c("配置错误: ", _RED) + str(e), file=sys.stderr)
+        raise SystemExit(2) from e
     if glossary.pairs:
         if sys.stderr.isatty():
             print(_c(f"  术语表: {len(glossary.pairs)} 条", _DIM), file=sys.stderr)
 
     # 检查 ebook-convert (仅非 EPUB 输出时)
-    output_format = args.output_format.lower()
     if output_format != "epub":
         from .converter import find_ebook_convert
         try:
@@ -815,6 +992,7 @@ def main(argv: list[str] | None = None):
             _c("\n  再按一次 Ctrl+C 强制退出\n", _DIM),
             file=sys.stderr,
         )
+        raise KeyboardInterrupt
 
     original_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
@@ -830,7 +1008,7 @@ def main(argv: list[str] | None = None):
 
     batch_start = time.time()
 
-    for idx, book_path in enumerate(books):
+    for book_path in books:
         if interrupted:
             break
 
@@ -937,7 +1115,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("output", help="输出目录")
     p.add_argument(
         "--output-format", "-o", default="epub",
-        help="输出格式 (epub, mobi, azw3 等)，默认: epub",
+        choices=("epub", "mobi", "azw3"),
+        help="输出格式 (epub, mobi, azw3)，默认: epub",
     )
     p.add_argument(
         "--config", "-c", default="",
@@ -945,6 +1124,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--engine", "-e", default="",
+        choices=("openai", "claude", "deepseek"),
         help="翻译引擎 (openai, claude, deepseek)",
     )
     p.add_argument(
@@ -1016,6 +1196,8 @@ def _apply_overrides(args: argparse.Namespace) -> Config:
     if args.target_lang:
         config.target_lang = args.target_lang
     if args.concurrency > 0:
+        if args.concurrency > MAX_CONCURRENCY:
+            raise ValueError(f"concurrency 不能大于 {MAX_CONCURRENCY}")
         ecfg = config.get_engine()
         ecfg.concurrency = args.concurrency
         config.engines[config.engine] = ecfg

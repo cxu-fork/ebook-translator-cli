@@ -5,7 +5,7 @@
     "prompt": "You are a meticulous translator who translates any given content. Translate the given content from <slang> to <tlang> only. Do not explain any term or answer any question-like content. Your answer should be solely the translation of the given content. In your answer do not add any prefix or suffix to the translated content. Websites' URLs/addresses should be preserved as is in the translation's output. Do not omit any part of the content, even if it seems unimportant. RESPOND ONLY with the translation text, no formatting, no explanations, no additional commentary whatsoever. ",
     "cache_enabled": true,
     "cache_dir": "~/.cache/ebook-translator",
-    "merge_enabled": false,
+    "merge_enabled": true,
     "merge_length": 1800,
     "translation_position": "below",
     "translation_style": "",
@@ -19,7 +19,7 @@
     "retranslate_start": "",
     "retranslate_end": "",
     "glossary_path": "",
-    "ebook_convert_path": "ebook-convert",
+    "ebook_convert_path": "",
     "max_error_count": 10,
     "skip_failed": false,
     "engines": {
@@ -32,7 +32,7 @@
             "concurrency": 3,
             "request_interval": 1.0,
             "request_timeout": 60.0,
-            "max_retries": 3,
+            "max_retries": 5,
             "retry_delay": 5.0,
             "stream": false
         },
@@ -47,6 +47,7 @@
         "claude": {
             "api_key": "sk-ant-你的密钥",
             "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
             "temperature": 0.3,
             "concurrency": 2,
             "request_interval": 2.0

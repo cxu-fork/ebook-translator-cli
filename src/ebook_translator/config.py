@@ -1,9 +1,14 @@
 """Configuration loading and defaults."""
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+_KNOWN_ENGINES = {"openai", "claude", "deepseek"}
+MAX_CONCURRENCY = 32
 
 DEFAULT_PROMPT = (
     "You are a meticulous translator who translates any given content. "
@@ -32,12 +37,12 @@ class EngineConfig:
     api_key: str = ""
     base_url: str = ""
     model: str = ""
-    temperature: float = 0.3
-    top_p: float = 1.0
+    temperature: float | None = 0.3
+    top_p: float | None = 1.0
     concurrency: int = 3
     request_interval: float = 1.0
     request_timeout: float = 60.0
-    max_retries: int = 3
+    max_retries: int = 5
     retry_delay: float = 5.0
     stream: bool = False
     extra: dict = field(default_factory=dict)
@@ -52,7 +57,7 @@ class Config:
     prompt: str = DEFAULT_PROMPT
     cache_enabled: bool = True
     cache_dir: str = ""
-    merge_enabled: bool = False
+    merge_enabled: bool = True
     merge_length: int = 1800
     translation_position: str = "below"  # below, above, only
     translation_style: str = ""
@@ -66,7 +71,7 @@ class Config:
     retranslate_start: str = ""
     retranslate_end: str = ""
     glossary_path: str = ""
-    ebook_convert_path: str = "ebook-convert"
+    ebook_convert_path: str = ""
     max_error_count: int = 10
     skip_failed: bool = False
     log_file: str = ""
@@ -86,8 +91,88 @@ def _build_engine(raw: dict) -> EngineConfig:
     ):
         if k in raw:
             kw[k] = raw[k]
-    extra = {k: v for k, v in raw.items() if k not in kw}
+    extra = dict(raw.get("extra", {}))
+    extra.update({k: v for k, v in raw.items() if k not in kw and k != "extra"})
     return EngineConfig(**kw, extra=extra)
+
+
+def _expect_type(raw: dict[str, Any], keys: tuple[str, ...], expected: type):
+    for key in keys:
+        if key in raw and type(raw[key]) is not expected:
+            raise ValueError(f"配置项 {key} 必须是 {expected.__name__}")
+
+
+def _validate_engine(name: str, raw: Any):
+    if name not in _KNOWN_ENGINES:
+        raise ValueError(f"未知引擎 '{name}'，可用: {sorted(_KNOWN_ENGINES)}")
+    if not isinstance(raw, dict):
+        raise ValueError(f"引擎配置 {name} 必须是对象")
+    _expect_type(raw, ("api_key", "base_url", "model"), str)
+    _expect_type(raw, ("concurrency", "max_retries"), int)
+    _expect_type(raw, ("stream",), bool)
+    for key in ("temperature", "top_p", "request_interval", "request_timeout", "retry_delay"):
+        if key in raw and raw[key] is None and key not in {"temperature", "top_p"}:
+            raise ValueError(f"引擎配置 {name}.{key} 不能为空")
+        if (key in raw and raw[key] is not None
+                and (isinstance(raw[key], bool)
+                     or not isinstance(raw[key], (int, float)))):
+            raise ValueError(f"引擎配置 {name}.{key} 必须是数字")
+        if key in raw and raw[key] is not None and not math.isfinite(raw[key]):
+            raise ValueError(f"引擎配置 {name}.{key} 必须是有限数字")
+    if "extra" in raw and not isinstance(raw["extra"], dict):
+        raise ValueError(f"引擎配置 {name}.extra 必须是对象")
+    for key in ("concurrency", "max_retries"):
+        if key in raw and raw[key] < 1:
+            raise ValueError(f"引擎配置 {name}.{key} 必须大于 0")
+    if raw.get("concurrency", 1) > MAX_CONCURRENCY:
+        raise ValueError(
+            f"引擎配置 {name}.concurrency 不能大于 {MAX_CONCURRENCY}")
+    if "request_timeout" in raw and raw["request_timeout"] <= 0:
+        raise ValueError(f"引擎配置 {name}.request_timeout 必须大于 0")
+    for key in ("request_interval", "retry_delay"):
+        if key in raw and raw[key] < 0:
+            raise ValueError(f"引擎配置 {name}.{key} 不能小于 0")
+    if raw.get("temperature") is not None and raw["temperature"] < 0:
+        raise ValueError(f"引擎配置 {name}.temperature 不能小于 0")
+    if (raw.get("temperature") is not None
+            and raw["temperature"] > (1 if name == "claude" else 2)):
+        raise ValueError(f"引擎配置 {name}.temperature 超出支持范围")
+    if raw.get("top_p") is not None and not 0 <= raw["top_p"] <= 1:
+        raise ValueError(f"引擎配置 {name}.top_p 必须在 0 到 1 之间")
+    extra = raw.get("extra", {})
+    max_tokens = raw.get("max_tokens", extra.get("max_tokens"))
+    if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 1):
+        raise ValueError(f"引擎配置 {name}.max_tokens 必须是正整数")
+
+
+def _validate_root(raw: Any):
+    if not isinstance(raw, dict):
+        raise ValueError("配置文件根节点必须是 JSON 对象")
+    _expect_type(raw, (
+        "engine", "source_lang", "target_lang", "prompt", "cache_dir",
+        "translation_position", "translation_style", "translate_tags",
+        "exclude_translate_tags", "only_files", "exclude_files",
+        "retranslate_file", "retranslate_start", "retranslate_end",
+        "glossary_path", "ebook_convert_path", "log_file",
+    ), str)
+    _expect_type(raw, (
+        "cache_enabled", "merge_enabled", "test_enabled", "skip_failed",
+    ), bool)
+    _expect_type(raw, ("merge_length", "test_num", "max_error_count"), int)
+    for key in ("merge_length", "test_num", "max_error_count"):
+        if key in raw and raw[key] < 0:
+            raise ValueError(f"配置项 {key} 不能小于 0")
+    engine = raw.get("engine", "openai")
+    if engine not in _KNOWN_ENGINES:
+        raise ValueError(f"未知引擎 '{engine}'，可用: {sorted(_KNOWN_ENGINES)}")
+    engines = raw.get("engines", {})
+    if not isinstance(engines, dict):
+        raise ValueError("配置项 engines 必须是对象")
+    for name, engine_raw in engines.items():
+        _validate_engine(name, engine_raw)
+    for name in _KNOWN_ENGINES:
+        if name in raw:
+            _validate_engine(name, raw[name])
 
 
 def load_config(path: str | Path | None) -> Config:
@@ -101,7 +186,10 @@ def load_config(path: str | Path | None) -> Config:
     if path:
         p = Path(path)
         if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"配置文件 JSON 无效: {e}") from e
         else:
             raise FileNotFoundError(
                 f"配置文件不存在: {p.resolve()}"
@@ -115,8 +203,13 @@ def load_config(path: str | Path | None) -> Config:
             candidates.insert(0, Path(sys.executable).parent / "config.json")
         for candidate in candidates:
             if candidate.is_file():
-                raw = json.loads(candidate.read_text(encoding="utf-8"))
+                try:
+                    raw = json.loads(candidate.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"配置文件 JSON 无效: {e}") from e
                 break
+
+    _validate_root(raw)
 
     cfg = Config()
     for top_key in (
@@ -136,7 +229,7 @@ def load_config(path: str | Path | None) -> Config:
         cfg.engines[ename] = _build_engine(ecfg)
 
     # Also accept flat engine keys like "openai": {...} at top level
-    for ename in ("openai", "claude", "deepseek", "google"):
+    for ename in _KNOWN_ENGINES:
         if ename in raw and isinstance(raw[ename], dict):
             cfg.engines.setdefault(ename, _build_engine(raw[ename]))
 

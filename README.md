@@ -6,26 +6,27 @@
 
 ```bash
 cd ebook-translator-cli
-pip install -e .
+pip install .
 ```
 
-依赖仅 `httpx` + `lxml` + `tqdm`，纯 Python，无需编译。
+运行依赖仅 `httpx` + `lxml` + `tqdm`。常见平台会直接安装 `lxml` 的预编译 wheel；如果当前平台没有匹配的 wheel，安装时可能需要编译器和系统库。
 
 开发/自测：
 
 ```bash
+pip install -e .
 python -m unittest discover -s tests
 ```
 
 ## 什么时候需要 calibre？
 
-工具内置了 [KindleUnpack](https://github.com/kevinhendricks/KindleUnpack)（纯 Python，零外部依赖），MOBI 和 AZW3 输入**不需要 calibre**。只有以下情况才需要：
+工具内置了 [KindleUnpack](https://github.com/kevinhendricks/KindleUnpack)，MOBI 和 AZW3 输入转换为 EPUB 时通常**不需要 calibre**；内置转换失败时会尝试用 calibre 回退。
 
 | 操作 | 需要 calibre |
 |------|:---:|
-| MOBI / AZW3 输入 -> EPUB | **不需要** (内置 KindleUnpack) |
-| PDF / DOCX / RTF 输入 | 需要 |
-| 输出为 MOBI / AZW3 | 需要 |
+| MOBI / AZW3 输入 -> EPUB | **通常不需要**（内置 KindleUnpack） |
+| AZW / PDF / DOCX 等其他非 EPUB 输入 | 需要 |
+| 输出为非 EPUB 格式 | 需要 |
 | 输入输出都是 EPUB | **不需要** |
 
 ### 安装 calibre（仅在需要时）
@@ -72,7 +73,7 @@ ebook-translator 输入 输出 [选项]
   输出                    输出目录
 
 选项:
-  --output-format, -o     输出格式 (epub, mobi, azw3)，默认: epub
+  --output-format, -o     输出格式，默认: epub；非 epub 输出需要 calibre
   --config, -c            配置文件路径
   --engine, -e            翻译引擎 (openai, claude, deepseek)
   --source-lang, -s       源语言
@@ -80,8 +81,14 @@ ebook-translator 输入 输出 [选项]
   --concurrency           并发数
   --force, -f             覆盖已存在的输出
   --no-cache              禁用缓存（不支持断点续翻）
+  --skip-failed           跳过翻译失败的段落，保留原文继续生成输出
   --log-file              日志文件
   --dry-run               预览模式
+  --test                  测试模式：仅翻译前几段
+  --test-num              测试模式翻译段落数，默认: 10
+  --retranslate-file      重翻译的页面文件名
+  --retranslate-start     重翻译起始文本
+  --retranslate-end       重翻译结束文本
   --version, -V           版本号
 ```
 
@@ -114,8 +121,8 @@ ebook-translator 输入 输出 [选项]
 | 输入 | 后端 | 说明 |
 |------|------|------|
 | epub | 内置 | 直接处理 |
-| mobi, azw3 | 内置 KindleUnpack | 纯 Python，无需 calibre |
-| pdf, docx, rtf, fb2, txt, html | calibre | 需安装 |
+| mobi, azw3 | 内置 KindleUnpack | 输出 EPUB 时通常无需 calibre；失败时可回退 calibre |
+| azw, fb2, pdf, rtf, txt, docx, html, htm, odt, pdb, cbz, cbr | calibre | 需安装 |
 
 | 输出 | 后端 | 说明 |
 |------|------|------|
@@ -126,7 +133,7 @@ ebook-translator 输入 输出 [选项]
 
 进度缓存在 `~/.cache/ebook-translator/books/`。中断后重跑同一命令自动续翻。
 
-缓存 key 会绑定源文件内容、提取后的段落、引擎、模型、地址、源/目标语言、prompt、术语表和合并参数。修改这些内容后会自动使用新的缓存，避免误用旧译文。
+缓存 key 会绑定源文件内容、提取后的段落、引擎、模型、地址、采样参数、额外请求参数、源/目标语言、prompt 和术语表。修改这些内容后会自动使用新的缓存，避免误用旧译文；切换合并批次或译文样式会继续复用已有的逐段译文。
 
 使用 `--no-cache` 会改用内存缓存：本次运行仍能完成写回，但不会落盘，也不会在下次运行复用译文。
 
@@ -159,9 +166,11 @@ another target
 ## VPS 部署
 
 ```bash
-# 安装
-pip install httpx lxml tqdm
-# 如需非 EPUB 输入: wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
+# 在项目目录安装程序及依赖
+pip install .
+
+# 如需 AZW / PDF / DOCX 等输入，或输出非 EPUB 格式，再安装 calibre
+# wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin
 
 # 配置
 cp config.example.json config.json
