@@ -10,4 +10,5 @@ config.json
 *.db-wal
 dist/
 build/
+target/
 *.spec

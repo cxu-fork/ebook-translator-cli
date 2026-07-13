@@ -1,26 +1,21 @@
 # ebook-translator
 
-无头命令行批量电子书翻译工具。专为 VPS / 服务器设计，资源占用极低。
+无头命令行批量电子书翻译工具。Rust 单文件程序，运行时无需 Python 和 pip 依赖。
 
 ## 安装
 
-```bash
-cd ebook-translator-cli
-pip install .
-```
-
-运行依赖仅 `httpx` + `lxml` + `tqdm`。常见平台会直接安装 `lxml` 的预编译 wheel；如果当前平台没有匹配的 wheel，安装时可能需要编译器和系统库。
-
-开发/自测：
+从 Release 下载对应平台的 `ebook-translator` 单文件即可。源码构建：
 
 ```bash
-pip install -e .
-python -m unittest discover -s tests
+cargo build --release
+./target/release/ebook-translator --version
 ```
+
+开发自测：`cargo test && cargo clippy --all-targets -- -D warnings`。
 
 ## 什么时候需要 calibre？
 
-工具内置了 [KindleUnpack](https://github.com/kevinhendricks/KindleUnpack)，MOBI 和 AZW3 输入转换为 EPUB 时通常**不需要 calibre**；内置转换失败时会尝试用 calibre 回退。
+工具静态内置了 [libmobi](https://github.com/bfabiszewski/libmobi)，MOBI 和 AZW3 输入转换为 EPUB 时通常**不需要 calibre**；内置转换失败时会尝试用 calibre 回退。
 
 | 操作 | 需要 calibre |
 |------|:---:|
@@ -121,7 +116,7 @@ ebook-translator 输入 输出 [选项]
 | 输入 | 后端 | 说明 |
 |------|------|------|
 | epub | 内置 | 直接处理 |
-| mobi, azw3 | 内置 KindleUnpack | 输出 EPUB 时通常无需 calibre；失败时可回退 calibre |
+| mobi, azw3 | 内置 libmobi | 输出 EPUB 时通常无需 calibre；失败时可回退 calibre |
 | azw, fb2, pdf, rtf, txt, docx, html, htm, odt, pdb, cbz, cbr | calibre | 需安装 |
 
 | 输出 | 后端 | 说明 |
@@ -166,8 +161,8 @@ another target
 ## VPS 部署
 
 ```bash
-# 在项目目录安装程序及依赖
-pip install .
+# 复制 Release 中的单文件程序
+install -m 755 ebook-translator /usr/local/bin/ebook-translator
 
 # 如需 AZW / PDF / DOCX 等输入，或输出非 EPUB 格式，再安装 calibre
 # wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sudo sh /dev/stdin

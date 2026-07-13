@@ -1,0 +1,34 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          ext=""; [ "${{ runner.os }}" = Windows ] && ext=".exe"
+          cp "target/${{ matrix.target }}/release/ebook-translator${ext}" "ebook-translator-${{ matrix.target }}${ext}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ebook-translator-${{ matrix.target }}*
