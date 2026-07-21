@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,13 +10,14 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rand::RngExt;
-use serde_json::{Value, json};
+use regex::Regex;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     cache::{Paragraph, TranslationCache},
     config::{Config, MAX_CONCURRENCY},
     engine::{ApiError, Engine},
+    epub::accept_markup_translation,
     glossary::Glossary,
 };
 
@@ -171,50 +172,79 @@ impl TranslationWorker {
     async fn translate_group(&self, group: &[Paragraph]) -> Result<HashMap<String, String>> {
         if group.len() == 1 {
             let paragraph = &group[0];
-            let result = self
-                .translate_one(
-                    &self.glossary.apply(&paragraph.original),
-                    &self.config.prompt,
-                )
-                .await?;
-            return Ok([(paragraph.id.clone(), self.glossary.restore(result.trim()))].into());
+            return Ok([(
+                paragraph.id.clone(),
+                self.translate_paragraph(paragraph).await?,
+            )]
+            .into());
         }
-        let segments = group.iter().enumerate().map(|(id, paragraph)| json!({"id": id.to_string(), "text": self.glossary.apply(&paragraph.original)})).collect::<Vec<_>>();
-        let prompt = format!(
-            "{}\n\nYou will receive a JSON array of segments. Translate each segment text independently and preserve all segment ids. Return only valid JSON in this exact shape: [{{\"id\":\"0\",\"text\":\"translated text\"}}]. Do not wrap it in Markdown and do not add explanations.",
-            self.config.prompt
-        );
-        let response = self
-            .translate_one(&serde_json::to_string(&segments)?, &prompt)
-            .await?;
-        let expected = (0..group.len()).map(|x| x.to_string()).collect();
-        let merged = match parse_merged_result(&response, &expected) {
-            Ok(result) => result,
-            Err(error) => {
-                eprintln!("  合并翻译解析失败，回退逐段: {error}");
-                let mut fallback = HashMap::new();
-                for paragraph in group {
-                    let result = self
-                        .translate_one(
-                            &self.glossary.apply(&paragraph.original),
-                            &self.config.prompt,
-                        )
-                        .await?;
-                    fallback.insert(paragraph.id.clone(), self.glossary.restore(result.trim()));
-                }
-                return Ok(fallback);
-            }
-        };
-        Ok(group
+        // ponytail: markup-bearing paragraphs never merge; free models drop tokens under multi-paragraph prompts
+        let original = group
             .iter()
-            .enumerate()
-            .map(|(id, paragraph)| {
-                (
-                    paragraph.id.clone(),
-                    self.glossary.restore(merged[&id.to_string()].trim()),
-                )
-            })
-            .collect())
+            .map(|paragraph| self.glossary.apply(&paragraph.original))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let response = self
+            .translate_one(&original, self.config.effective_prompt())
+            .await?;
+        let parts = Regex::new(r"\r?\n\s*\r?\n")?
+            .split(response.trim())
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if parts.len() == group.len() {
+            let mut translations = HashMap::new();
+            let mut valid = true;
+            for (paragraph, translation) in group.iter().zip(parts) {
+                match accept_markup_translation(
+                    &paragraph.original,
+                    &self.glossary.restore(translation),
+                ) {
+                    Ok(translation) => {
+                        translations.insert(paragraph.id.clone(), translation);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                return Ok(translations);
+            }
+            eprintln!("  合并翻译损坏 HTML 占位符，回退逐段");
+        } else {
+            eprintln!(
+                "  合并翻译段落数不匹配（预期 {}, 实际 {}），回退逐段",
+                group.len(),
+                parts.len()
+            );
+        }
+        let mut fallback = HashMap::new();
+        for paragraph in group {
+            fallback.insert(
+                paragraph.id.clone(),
+                self.translate_paragraph(paragraph).await?,
+            );
+        }
+        Ok(fallback)
+    }
+
+    async fn translate_paragraph(&self, paragraph: &Paragraph) -> Result<String> {
+        let original = self.glossary.apply(&paragraph.original);
+        let has_tokens = paragraph.original.contains("{{etm_");
+        let prompt = markup_prompt(self.config.effective_prompt(), has_tokens);
+        for attempt in 0..=usize::from(has_tokens) {
+            let result = self.translate_one(&original, &prompt).await?;
+            let restored = self.glossary.restore(result.trim());
+            match accept_markup_translation(&paragraph.original, &restored) {
+                Ok(translation) => return Ok(translation),
+                Err(error) if attempt == 0 && has_tokens => {
+                    eprintln!("  模型损坏 HTML 占位符，自动重试一次: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
     }
 
     async fn translate_one(&self, text: &str, prompt: &str) -> Result<String> {
@@ -280,6 +310,15 @@ impl TranslationWorker {
     }
 }
 
+fn markup_prompt(prompt: &str, has_tokens: bool) -> String {
+    if !has_tokens {
+        return prompt.into();
+    }
+    format!(
+        "{prompt}\n\nThe input may contain immutable HTML placeholder tokens such as {{{{etm_o_00000}}}}, {{{{etm_c_00000}}}}, and {{{{etm_n_00000}}}}. Copy every such token exactly once, character-for-character, in the same order and nesting. Never translate, alter, add, remove, split, or surround these tokens with spaces. Translate only the human-readable text between them."
+    )
+}
+
 fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Vec<Paragraph>> {
     if !enabled || limit == 0 {
         return paragraphs.iter().cloned().map(|x| vec![x]).collect();
@@ -289,6 +328,14 @@ fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Ve
     let mut length = 0;
     for paragraph in paragraphs {
         let size = paragraph.original.chars().count();
+        if paragraph.original.contains("{{etm_") {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+                length = 0;
+            }
+            groups.push(vec![paragraph.clone()]);
+            continue;
+        }
         if !current.is_empty() && length + size > limit {
             groups.push(std::mem::take(&mut current));
             length = 0;
@@ -300,76 +347,6 @@ fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Ve
         groups.push(current);
     }
     groups
-}
-
-fn parse_merged_result(
-    response: &str,
-    expected: &HashSet<String>,
-) -> Result<HashMap<String, String>> {
-    let mut text = response.trim();
-    if text.starts_with("```") {
-        text = text
-            .strip_prefix("```json")
-            .or_else(|| text.strip_prefix("```JSON"))
-            .or_else(|| text.strip_prefix("```"))
-            .unwrap_or(text)
-            .trim();
-        text = text.strip_suffix("```").unwrap_or(text).trim();
-    }
-    if let Some(start) = [text.find('['), text.find('{')].into_iter().flatten().min() {
-        text = &text[start..];
-    }
-    let mut data: Value = serde_json::from_str(text)?;
-    if let Some(value) = data
-        .get("segments")
-        .or_else(|| data.get("translations"))
-        .filter(|x| x.is_array())
-    {
-        data = value.clone();
-    }
-    let mut result = HashMap::new();
-    match data {
-        Value::Object(values) => {
-            for (key, value) in values {
-                result.insert(
-                    key,
-                    value
-                        .as_str()
-                        .ok_or_else(|| anyhow!("合并翻译返回的译文必须是字符串"))?
-                        .to_owned(),
-                );
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                let object = value
-                    .as_object()
-                    .ok_or_else(|| anyhow!("合并翻译返回的数组元素不是对象"))?;
-                let id = object
-                    .get("id")
-                    .map(|x| {
-                        x.as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| x.to_string())
-                    })
-                    .unwrap_or_default();
-                let text = object
-                    .get("text")
-                    .or_else(|| object.get("translation"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("合并翻译返回的译文必须是字符串"))?;
-                result.insert(id, text.to_owned());
-            }
-        }
-        _ => bail!("合并翻译返回格式无效"),
-    }
-    if result.keys().cloned().collect::<HashSet<_>>() != *expected {
-        bail!("合并翻译返回的 segment id 不完整");
-    }
-    if result.values().any(|x| x.trim().is_empty()) {
-        bail!("合并翻译返回空译文");
-    }
-    Ok(result)
 }
 
 fn classify_error(error: &anyhow::Error) -> ErrorKind {
@@ -426,9 +403,15 @@ fn classify_error(error: &anyhow::Error) -> ErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epub::validate_markup_tokens;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     #[test]
-    fn grouping_and_merge_parser_cover_fallback_shapes() {
+    fn grouping_and_markup_validation() {
         let paragraph = |id: &str, text: &str| Paragraph {
             id: id.into(),
             md5: id.into(),
@@ -456,9 +439,228 @@ mod tests {
             .collect::<Vec<_>>(),
             [2, 1]
         );
-        let expected = ["0".into(), "1".into()].into();
-        let result = parse_merged_result("```json\n{\"translations\":[{\"id\":\"0\",\"text\":\"a\"},{\"id\":\"1\",\"translation\":\"b\"}]}\n```", &expected).unwrap();
-        assert_eq!(result["1"], "b");
-        assert!(parse_merged_result("{\"0\": 1}", &["0".into()].into()).is_err());
+        assert_eq!(
+            merge_groups(
+                &[
+                    paragraph("a", "{{etm_o_00000}}12{{etm_c_00000}}"),
+                    paragraph("b", "34"),
+                    paragraph("c", "5")
+                ],
+                true,
+                40
+            )
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let original = "{{etm_o_00000}}a{{etm_n_00001}}{{etm_c_00000}}";
+        assert!(validate_markup_tokens(original, original).is_ok());
+        assert!(validate_markup_tokens(original, "a").is_err());
+        assert!(
+            validate_markup_tokens(original, "{{etm_c_00000}}{{etm_o_00000}}{{etm_n_00001}}")
+                .is_err()
+        );
+        let prompt = markup_prompt("translate", true);
+        assert!(prompt.contains("Copy every such token exactly once"));
+        assert_eq!(markup_prompt("translate", false), "translate");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broken_markup_is_retried_once_and_normalized() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let server = thread::spawn(move || {
+            for response in ["译文"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + length {
+                        break;
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": response}, "finish_reason": "stop"}]
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut config = Config::default();
+        config.engines.insert(
+            "openai".into(),
+            crate::config::EngineConfig {
+                api_key: "test".into(),
+                base_url: format!("http://{address}/v1"),
+                model: "mock".into(),
+                request_interval: 0.0,
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            "openai",
+            config.engine_config(None),
+            &config.source_lang,
+            &config.target_lang,
+        )
+        .unwrap();
+        let worker = TranslationWorker::new(
+            engine,
+            Arc::new(TranslationCache::open(std::path::Path::new("unused"), false).unwrap()),
+            config,
+            Glossary::default(),
+        );
+        let paragraph = Paragraph {
+            id: "a".into(),
+            md5: "a".into(),
+            raw: String::new(),
+            original: "{{etm_o_00000}}text{{etm_c_00000}}".into(),
+            ignored: false,
+            attributes: None,
+            page: None,
+            translation: None,
+            engine_name: None,
+            target_lang: None,
+        };
+        let result = worker.translate_paragraph(&paragraph).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(result, "{{etm_o_00000}}译文{{etm_c_00000}}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(requests.lock().unwrap()[0].contains("immutable HTML placeholder"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_count_mismatch_falls_back_to_individual_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_captured = captured.clone();
+        let server = thread::spawn(move || {
+            for response in ["只返回一段", "甲", "乙"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4);
+                    let Some(header_end) = header_end else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + length {
+                        break;
+                    }
+                }
+                server_captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": response}, "finish_reason": "stop"}]
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut config = Config {
+            merge_enabled: true,
+            source_lang: "Auto detect".into(),
+            ..Default::default()
+        };
+        config.engines.insert(
+            "openai".into(),
+            crate::config::EngineConfig {
+                api_key: "test".into(),
+                base_url: format!("http://{address}/v1"),
+                model: "mock".into(),
+                request_interval: 0.0,
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            "openai",
+            config.engine_config(None),
+            &config.source_lang,
+            &config.target_lang,
+        )
+        .unwrap();
+        let paragraph = |id: &str, original: &str| Paragraph {
+            id: id.into(),
+            md5: id.into(),
+            raw: String::new(),
+            original: original.into(),
+            ignored: false,
+            attributes: None,
+            page: None,
+            translation: None,
+            engine_name: None,
+            target_lang: None,
+        };
+        let worker = TranslationWorker::new(
+            engine,
+            Arc::new(TranslationCache::open(std::path::Path::new("unused"), false).unwrap()),
+            config,
+            Glossary::default(),
+        );
+        let result = worker
+            .translate_group(&[paragraph("a", "one"), paragraph("b", "two")])
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result["a"], "甲");
+        assert_eq!(result["b"], "乙");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains(r"one\n\ntwo"));
+        assert!(requests[0].contains("detected language"));
     }
 }

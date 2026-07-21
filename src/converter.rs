@@ -40,7 +40,13 @@ impl ConvertedEpub {
     }
 }
 
-pub fn convert(input: &Path, output: &Path, output_format: &str, custom: &Path) -> Result<()> {
+pub fn convert(
+    input: &Path,
+    output: &Path,
+    output_format: &str,
+    custom: &Path,
+    input_encoding: Option<&str>,
+) -> Result<()> {
     let input_format = input
         .extension()
         .and_then(|x| x.to_str())
@@ -49,11 +55,18 @@ pub fn convert(input: &Path, output: &Path, output_format: &str, custom: &Path) 
     let mut native_error = None;
     if matches!(input_format.as_str(), "mobi" | "azw3") && output_format == "epub" {
         match mobi_to_epub_file(input, output) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if input_encoding.is_some() {
+                    eprintln!(
+                        "  input_encoding 仅传给 ebook-convert；内置 MOBI/AZW3 路径已忽略该选项"
+                    );
+                }
+                return Ok(());
+            }
             Err(error) => native_error = Some(error),
         }
     }
-    if let Err(error) = ebook_convert(input, output, output_format, custom) {
+    if let Err(error) = ebook_convert(input, output, output_format, custom, input_encoding) {
         if let Some(native_error) = native_error {
             bail!(
                 "内置 MOBI/AZW3 转换失败，ebook-convert 回退也失败。\n\n内置转换错误: {native_error:#}\n\nebook-convert 错误: {error:#}"
@@ -64,18 +77,25 @@ pub fn convert(input: &Path, output: &Path, output_format: &str, custom: &Path) 
     Ok(())
 }
 
-pub fn convert_to_epub(input: &Path, custom: &Path) -> Result<ConvertedEpub> {
+pub fn convert_to_epub(
+    input: &Path,
+    custom: &Path,
+    input_encoding: Option<&str>,
+) -> Result<ConvertedEpub> {
     if input
         .extension()
         .and_then(|x| x.to_str())
         .is_some_and(|x| x.eq_ignore_ascii_case("epub"))
     {
+        if input_encoding.is_some() {
+            eprintln!("  input_encoding 仅传给 ebook-convert；原生 EPUB 路径已忽略该选项");
+        }
         return Ok(ConvertedEpub::borrowed(input));
     }
     let owner = tempfile::Builder::new().prefix("et_epub_").tempdir()?;
     let stem = input.file_stem().and_then(|x| x.to_str()).unwrap_or("book");
     let path = owner.path().join(format!("{stem}.epub"));
-    convert(input, &path, "epub", custom)?;
+    convert(input, &path, "epub", custom, input_encoding)?;
     Ok(ConvertedEpub {
         path,
         _owner: Some(owner),
@@ -116,6 +136,7 @@ pub fn ebook_convert(
     output: &Path,
     output_format: &str,
     custom: &Path,
+    input_encoding: Option<&str>,
 ) -> Result<()> {
     let binary = find_ebook_convert(custom)?;
     if let Some(parent) = output.parent() {
@@ -130,6 +151,9 @@ pub fn ebook_convert(
     let temp_output = temp_dir.path().join(format!("output.{suffix}"));
     let mut command = Command::new(&binary);
     command.arg(input).arg(&temp_output);
+    if let Some(encoding) = input_encoding {
+        command.arg("--input-encoding").arg(encoding);
+    }
     if matches!(output_format, "epub" | "mobi" | "azw3") {
         command.arg("--enable-heuristics");
     }
@@ -239,5 +263,33 @@ mod tests {
                 .to_string()
                 .contains("配置的")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_encoding_is_forwarded_to_ebook_convert() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.txt");
+        let output = dir.path().join("output.epub");
+        let binary = dir.path().join("ebook-convert");
+        let arguments = dir.path().join("arguments.txt");
+        fs::write(&input, "book").unwrap();
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncp \"$1\" \"$2\"\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        ebook_convert(&input, &output, "epub", &binary, Some("GBK")).unwrap();
+        let arguments = fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("--input-encoding\nGBK\n"));
+        assert_eq!(fs::read_to_string(output).unwrap(), "book");
     }
 }

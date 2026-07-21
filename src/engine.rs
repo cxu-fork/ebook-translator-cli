@@ -111,9 +111,17 @@ impl Engine {
     }
 
     pub async fn translate(&self, text: &str, prompt: &str) -> Result<String> {
+        let source_lang = if matches!(
+            self.source_lang.trim().to_ascii_lowercase().as_str(),
+            "auto" | "auto detect" | "auto-detect"
+        ) {
+            "detected language"
+        } else {
+            &self.source_lang
+        };
         let prompt = prompt
             .replace("<tlang>", &self.target_lang)
-            .replace("<slang>", &self.source_lang);
+            .replace("<slang>", source_lang);
         let body = self.body(text, &prompt, self.config.stream)?;
         let mut request = self
             .client
@@ -191,11 +199,17 @@ impl Engine {
                 }
             }
         }
-        if let Some(value) = self.config.temperature {
-            body.insert("temperature".into(), json!(value));
-        }
-        if let Some(value) = self.config.top_p {
-            body.insert("top_p".into(), json!(value));
+        match self.config.sampling.as_str() {
+            "top_p" => {
+                if let Some(value) = self.config.top_p {
+                    body.insert("top_p".into(), json!(value));
+                }
+            }
+            _ => {
+                if let Some(value) = self.config.temperature {
+                    body.insert("temperature".into(), json!(value));
+                }
+            }
         }
         if stream {
             body.insert("stream".into(), json!(true));
@@ -456,6 +470,18 @@ mod tests {
         let engine = Engine::new("openai", cfg("https://x/v1"), "en", "zh").unwrap();
         assert!(engine.model.is_empty());
         assert!(engine.body("x", "p", false).unwrap().get("model").is_none());
+    }
+
+    #[test]
+    fn only_selected_sampling_is_sent() {
+        let mut config = cfg("https://example.com/v1");
+        config.temperature = Some(0.2);
+        config.top_p = Some(0.8);
+        config.sampling = "top_p".into();
+        let engine = Engine::new("openai", config, "auto", "Chinese").unwrap();
+        let body = engine.body("x", "translate", false).unwrap();
+        assert_eq!(body.get("top_p"), Some(&json!(0.8)));
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]

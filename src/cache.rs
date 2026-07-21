@@ -164,6 +164,49 @@ impl TranslationCache {
         Ok(changed)
     }
 
+    pub fn clear_all_translations(&self) -> Result<usize> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("缓存锁已损坏"))?
+            .execute(
+                "UPDATE cache SET translation=NULL, engine_name=NULL, target_lang=NULL WHERE NOT ignored",
+                [],
+            )?)
+    }
+
+    pub fn apply_review(
+        &self,
+        rows: &[(String, Option<String>, bool, bool)],
+        engine: &str,
+        target_lang: &str,
+    ) -> Result<()> {
+        let mut conn = self.0.lock().map_err(|_| anyhow!("缓存锁已损坏"))?;
+        let tx = conn.transaction()?;
+        for (id, translation, ignored, retranslate) in rows {
+            if *retranslate {
+                tx.execute(
+                    "UPDATE cache SET ignored=0, translation=NULL, engine_name=NULL, target_lang=NULL WHERE id=?1",
+                    [id],
+                )?;
+            } else if *ignored {
+                tx.execute(
+                    "UPDATE cache SET ignored=1, translation=NULL, engine_name=NULL, target_lang=NULL WHERE id=?1",
+                    [id],
+                )?;
+            } else if let Some(translation) = translation {
+                tx.execute(
+                    "UPDATE cache SET ignored=0, translation=?2, engine_name=?3, target_lang=?4 WHERE id=?1",
+                    params![id, translation, engine, target_lang],
+                )?;
+            } else {
+                tx.execute("UPDATE cache SET ignored=0 WHERE id=?1", [id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn counts(&self) -> Result<(usize, usize)> {
         let conn = self.0.lock().map_err(|_| anyhow!("缓存锁已损坏"))?;
         let translated = conn.query_row(
@@ -222,5 +265,19 @@ mod tests {
             .update_translations(&[("2".into(), "二".into(), "e".into(), "zh".into())])
             .unwrap();
         assert_eq!(cache.counts().unwrap(), (1, 2));
+        cache
+            .apply_review(
+                &[("1".into(), Some("一".into()), false, false)],
+                "manual",
+                "zh",
+            )
+            .unwrap();
+        assert_eq!(cache.counts().unwrap(), (2, 2));
+        assert_eq!(cache.clear_all_translations().unwrap(), 2);
+        assert_eq!(cache.counts().unwrap(), (0, 2));
+        cache
+            .apply_review(&[("1".into(), None, true, false)], "manual", "zh")
+            .unwrap();
+        assert!(cache.all_with_ignored().unwrap()[1].ignored);
     }
 }

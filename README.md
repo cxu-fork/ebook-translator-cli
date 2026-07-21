@@ -61,11 +61,11 @@ ebook-translator /path/to/books /path/to/output --dry-run
 ## 用法
 
 ```
-ebook-translator 输入 输出 [选项]
+ebook-translator 输入 [输出] [选项]
 
 位置参数:
   输入                    输入目录或单个电子书文件
-  输出                    输出目录
+  输出                    输出目录；--review-export 时可省略
 
 选项:
   --output-format, -o     输出格式，默认: epub；非 epub 输出需要 calibre
@@ -73,6 +73,8 @@ ebook-translator 输入 输出 [选项]
   --engine, -e            翻译引擎 (openai, claude, deepseek)
   --source-lang, -s       源语言
   --target-lang, -t       目标语言
+  --target-lang-code      译文 BCP-47 语言标签
+  --target-direction      译文方向 (auto, ltr, rtl)
   --concurrency           并发数
   --force, -f             覆盖已存在的输出
   --no-cache              禁用缓存（不支持断点续翻）
@@ -84,6 +86,13 @@ ebook-translator 输入 输出 [选项]
   --retranslate-file      重翻译的页面文件名
   --retranslate-start     重翻译起始文本
   --retranslate-end       重翻译结束文本
+  --retranslate-all       清除全部可翻译段落缓存
+  --translate-metadata    翻译 OPF 元数据
+  --translate-title       翻译书名并用于文件名
+  --custom-title          自定义书名（仅单书）
+  --input-encoding        ebook-convert 输入编码
+  --review-export         导出校审 JSON，不调用 API
+  --review-import         导入部分或完整校审 JSON
   --version, -V           版本号
 ```
 
@@ -134,17 +143,19 @@ ebook-translator 输入 输出 [选项]
 
 如果某本书仍有段落翻译失败，程序会保留缓存进度但不生成半翻译输出文件；修好配置或换 key 后重跑即可继续。
 
-`merge_enabled: true` 会按 `merge_length` 把多个短段落合并成一次请求，再逐段写回缓存。若模型没有按要求返回可解析 JSON，这一组合并请求会自动回退成逐段翻译。
+`merge_enabled` 默认关闭。启用后会按 `merge_length` 用双换行合并短段落，再逐段写回缓存；返回段落数不一致时自动回退逐段翻译。
 
 ## 退出码与日志
 
 | 退出码 | 含义 |
 |------:|------|
-| 0 | 全部成功，或只有已存在输出被跳过 |
-| 1 | 至少一本书失败 |
+| 0 | 全部成功 |
+| 1 | 至少一本书失败，或输出重名且未使用 `--force` |
 | 130 | 用户中断 |
 
 `--log-file /path/to/run.log` 会写入批处理、缓存、失败原因和注入统计，适合配合 `nohup`、systemd 或 cron 排查。
+
+输出名取自最终书名，优先级为：自定义书名、翻译书名、OPF 书名、输入文件名。文件名会跨平台清理并限制为 200 字符；只有 `--force` 才允许原子覆盖重名文件。
 
 ## 术语表
 
@@ -157,6 +168,27 @@ another target
 ```
 
 `config.json` 中设置：`"glossary_path": "/path/to/glossary.txt"`
+
+也可内联配置，内联值会覆盖文件中的同名源词：
+
+```json
+{"glossary": {"AI model": "AI 模型", "OpenAI": "OpenAI"}}
+```
+
+## 人工校审
+
+```bash
+# 只抽取并加载缓存，不调用 API、不生成译本
+ebook-translator book.epub --review-export review.json
+
+# 可编辑 translation、ignored 和 action（keep/retranslate），再导入生成
+ebook-translator book.epub output --review-import review.json
+
+# 清除全部可翻译段落缓存
+ebook-translator book.epub output --retranslate-all
+```
+
+导入会原子校验源文件哈希、全书元素签名及每段 ID/原文/签名；未知、重复或过期记录会整体拒绝。
 
 ## VPS 部署
 
