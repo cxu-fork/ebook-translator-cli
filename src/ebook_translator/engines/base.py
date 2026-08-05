@@ -36,7 +36,10 @@ class TranslationEngine(ABC):
 
     def build_prompt(self, prompt_template: str) -> str:
         prompt = prompt_template.replace("<tlang>", self.target_lang)
-        prompt = prompt.replace("<slang>", self.source_lang)
+        source = self.source_lang.strip()
+        if source.lower() in {"auto", "auto detect", "auto-detect"}:
+            source = "detected language"
+        prompt = prompt.replace("<slang>", source)
         return prompt
 
     def close(self) -> None:

@@ -1,14 +1,22 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::Path,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use dom_query::{Document, Matcher, NodeRef};
+use dom_query::{Document, Matcher, NodeRef, SerializableNodeRef};
+use html5ever::{
+    QualName,
+    serialize::{AttrRef, Serialize, Serializer, TraversalScope},
+};
 use percent_encoding::percent_decode_str;
-use quick_xml::{Reader, escape::unescape, events::Event};
+use quick_xml::{
+    Reader, Writer,
+    escape::{resolve_xml_entity, unescape},
+    events::{BytesText, Event},
+};
 use regex::{Captures, Regex};
 use tempfile::NamedTempFile;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -42,6 +50,7 @@ const NON_INLINE_TAGS: &[&str] = &[
     "footer",
     "header",
     "legend",
+    "li",
     "main",
     "p",
     "pre",
@@ -165,7 +174,7 @@ pub fn extract_from_epub(
             elements.extend(extract_nav(
                 &read_member(&mut archive, &resolved)?,
                 &item.href,
-            ));
+            )?);
         }
     } else if let Some(item) = ncx {
         let resolved = resolve_href(&opf_path, &item.href);
@@ -177,7 +186,12 @@ pub fn extract_from_epub(
         }
     }
 
-    for item in ordered_content_items(&package, nav.map(|item| item.id.as_str())) {
+    let content_items = ordered_content_items(
+        &package,
+        nav.map(|item| item.id.as_str()),
+        ncx.map(|item| item.id.as_str()),
+    );
+    for item in &content_items {
         if !file_selected(&item.href, &config.only_files, &config.exclude_files) {
             continue;
         }
@@ -230,6 +244,10 @@ pub fn write_translated_epub(
     let opf = read_member(&mut archive, &opf_path)?;
     let package = parse_package(&opf)?;
     let rules = Rules::new(config)?;
+    let names = archive
+        .file_names()
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
     let nav = package
         .manifest
         .iter()
@@ -251,27 +269,35 @@ pub fn write_translated_epub(
 
     if let Some(item) = nav {
         let resolved = resolve_href(&opf_path, &item.href);
-        let (data, count) = inject_nav(
-            &read_member(&mut archive, &resolved)?,
-            &item.href,
-            translations,
-            &config.translation_position,
-        )?;
-        modified.insert(resolved, data);
-        injected += count;
+        if names.contains(&resolved) {
+            let (data, count) = inject_nav(
+                &read_member(&mut archive, &resolved)?,
+                &item.href,
+                translations,
+                &config.translation_position,
+            )?;
+            modified.insert(resolved, data);
+            injected += count;
+        }
     } else if let Some(item) = ncx {
         let resolved = resolve_href(&opf_path, &item.href);
-        let (data, count) = rewrite_ncx(
-            &read_member(&mut archive, &resolved)?,
-            &item.href,
-            translations,
-            &config.translation_position,
-        )?;
-        modified.insert(resolved, data);
-        injected += count;
+        if names.contains(&resolved) {
+            let (data, count) = rewrite_ncx(
+                &read_member(&mut archive, &resolved)?,
+                &item.href,
+                translations,
+                &config.translation_position,
+            )?;
+            modified.insert(resolved, data);
+            injected += count;
+        }
     }
 
-    for item in ordered_content_items(&package, nav.map(|item| item.id.as_str())) {
+    for item in ordered_content_items(
+        &package,
+        nav.map(|item| item.id.as_str()),
+        ncx.map(|item| item.id.as_str()),
+    ) {
         if !file_selected(&item.href, &config.only_files, &config.exclude_files) {
             continue;
         }
@@ -311,7 +337,10 @@ pub fn write_translated_epub(
     }
     writer.finish()?;
     let (_, temp_path) = temp.keep()?;
-    replace(&temp_path, output)?;
+    if let Err(error) = replace(&temp_path, output) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     Ok(injected)
 }
 
@@ -362,15 +391,14 @@ fn ensure_markup_tokens(original: &str, translated: &str) -> Result<()> {
 }
 
 pub fn normalize_markup_tokens(value: &str) -> String {
-    let pattern =
-        Regex::new(r"\{\{\s*etm\s*_\s*([ocn])\s*_\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*\}\}")
-            .unwrap();
+    let pattern = Regex::new(r"\{\{\s*etm\s*_\s*([ocn])\s*_\s*((?:\d\s*)+)\}\}").unwrap();
     pattern
         .replace_all(value, |capture: &Captures<'_>| {
-            format!(
-                "{{{{etm_{}_{}{}{}{}{}}}}}",
-                &capture[1], &capture[2], &capture[3], &capture[4], &capture[5], &capture[6]
-            )
+            let digits = capture[2]
+                .chars()
+                .filter(|character| character.is_ascii_digit())
+                .collect::<String>();
+            format!("{{{{etm_{}_{digits}}}}}", &capture[1])
         })
         .into_owned()
 }
@@ -422,7 +450,7 @@ pub fn repair_markup_tokens(original: &str, translated: &str) -> Option<String> 
 }
 
 fn markup_token_regex() -> Regex {
-    Regex::new(r"\{\{etm_(o|c|n)_(\d{5})\}\}").unwrap()
+    Regex::new(r"\{\{etm_(o|c|n)_(\d+)\}\}").unwrap()
 }
 
 impl Rules {
@@ -554,7 +582,6 @@ fn read_container(archive: &mut ZipArchive<File>) -> Result<String> {
 
 fn parse_package(data: &[u8]) -> Result<Package> {
     let mut reader = Reader::from_reader(data);
-    reader.config_mut().trim_text(true);
     let mut package = Package::default();
     let mut id_to_href = HashMap::new();
     let mut spine_ids = Vec::new();
@@ -609,11 +636,24 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                     }
                 }
             }
-            Event::Start(event) if event.local_name().as_ref() == b"title" => in_title = true,
-            Event::Text(text) if in_title && package.title.is_empty() => {
-                package.title = decode_xml_text(text.decode()?.as_ref())?;
+            Event::Start(event)
+                if event.local_name().as_ref() == b"title" && package.title.is_empty() =>
+            {
+                in_title = true
             }
-            Event::End(event) if event.local_name().as_ref() == b"title" => in_title = false,
+            Event::Text(text) if in_title => {
+                package
+                    .title
+                    .push_str(&decode_xml_text(text.decode()?.as_ref())?);
+            }
+            Event::CData(text) if in_title => package.title.push_str(text.decode()?.as_ref()),
+            Event::GeneralRef(reference) if in_title => {
+                push_general_ref(&mut package.title, &reference)?;
+            }
+            Event::End(event) if event.local_name().as_ref() == b"title" => {
+                in_title = false;
+                package.title = normalize_text(&package.title);
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -625,9 +665,17 @@ fn parse_package(data: &[u8]) -> Result<Package> {
     Ok(package)
 }
 
-fn ordered_content_items<'a>(package: &'a Package, nav_id: Option<&str>) -> Vec<&'a ManifestItem> {
+fn ordered_content_items<'a>(
+    package: &'a Package,
+    nav_id: Option<&str>,
+    ncx_id: Option<&str>,
+) -> Vec<&'a ManifestItem> {
     let is_content = |item: &&ManifestItem| {
         Some(item.id.as_str()) != nav_id
+            && Some(item.id.as_str()) != ncx_id
+            && !item
+                .media_type
+                .eq_ignore_ascii_case("application/x-dtbncx+xml")
             && (item.media_type.contains("html")
                 || matches!(item.media_type.as_str(), "application/xml" | "text/xml")
                 || [".xhtml", ".html", ".htm", ".xht", ".xml"]
@@ -635,21 +683,22 @@ fn ordered_content_items<'a>(package: &'a Package, nav_id: Option<&str>) -> Vec<
                     .any(|suffix| item.href.to_ascii_lowercase().ends_with(suffix)))
     };
     let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
     for href in &package.spine {
         if let Some(item) = package
             .manifest
             .iter()
             .find(|item| item.href == *href)
             .filter(is_content)
+            && seen.insert(item.href.as_str())
         {
             ordered.push(item);
         }
     }
-    let spine = package.spine.iter().collect::<HashSet<_>>();
     let mut remaining = package
         .manifest
         .iter()
-        .filter(|item| !spine.contains(&item.href))
+        .filter(|item| !seen.contains(item.href.as_str()))
         .filter(is_content)
         .collect::<Vec<_>>();
     remaining.sort_by(|left, right| left.href.cmp(&right.href));
@@ -679,6 +728,11 @@ fn extract_metadata(data: &[u8], resource: &str, config: &Config) -> Result<Vec<
             Event::CData(text) => {
                 if let Some((_, _, value)) = &mut current {
                     value.push_str(text.decode()?.as_ref());
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some((_, _, value)) = &mut current {
+                    push_general_ref(value, &reference)?;
                 }
             }
             Event::End(event) => {
@@ -729,6 +783,7 @@ fn extract_ncx(data: &[u8], resource: &str) -> Result<Vec<ExtractedElement>> {
                 value.push_str(&decode_xml_text(text.decode()?.as_ref())?)
             }
             Event::CData(text) if in_text => value.push_str(text.decode()?.as_ref()),
+            Event::GeneralRef(reference) if in_text => push_general_ref(&mut value, &reference)?,
             Event::End(event) if in_text && event.local_name().as_ref() == b"text" => {
                 let value = normalize_text(&value);
                 if !value.is_empty() {
@@ -752,9 +807,9 @@ fn extract_ncx(data: &[u8], resource: &str) -> Result<Vec<ExtractedElement>> {
     Ok(output)
 }
 
-fn extract_nav(data: &[u8], resource: &str) -> Vec<ExtractedElement> {
-    let document = parse_page(data);
-    nav_nodes(&document)
+fn extract_nav(data: &[u8], resource: &str) -> Result<Vec<ExtractedElement>> {
+    let document = parse_page(data)?;
+    Ok(nav_nodes(&document)
         .into_iter()
         .enumerate()
         .filter_map(|(index, node)| {
@@ -770,11 +825,11 @@ fn extract_nav(data: &[u8], resource: &str) -> Vec<ExtractedElement> {
                 )
             })
         })
-        .collect()
+        .collect())
 }
 
 fn extract_body(data: &[u8], resource: &str, rules: &Rules) -> Result<Vec<ExtractedElement>> {
-    let document = parse_page(data);
+    let document = parse_page(data)?;
     let Some(body) = document.body() else {
         return Ok(Vec::new());
     };
@@ -934,7 +989,7 @@ fn restore_markup(
         }
     }
     collect(node, rules, keep_ids, &mut 0, &mut literals);
-    let token = Regex::new(r"\{\{etm_[ocn]_\d{5}\}\}")?;
+    let token = Regex::new(r"\{\{etm_[ocn]_\d+\}\}")?;
     let mut output = String::new();
     let mut end = 0;
     for found in token.find_iter(&translated) {
@@ -957,7 +1012,7 @@ fn inject_body(
     config: &Config,
     rules: &Rules,
 ) -> Result<(Vec<u8>, usize)> {
-    let document = parse_page(data);
+    let document = parse_page(data)?;
     let Some(body) = document.body() else {
         return Ok((data.to_vec(), 0));
     };
@@ -969,15 +1024,21 @@ fn inject_body(
     let mut injected = 0;
     for (index, candidate) in candidates.into_iter().enumerate() {
         let uid = make_uid("body", resource, &index.to_string());
-        let Some(translation) = translations.get(&uid).filter(|value| !value.is_empty()) else {
+        let Some(translation) = translations.get(&uid) else {
             continue;
         };
+        if translation.trim().is_empty() {
+            bail!("空译文不能写入 EPUB: {uid}");
+        }
         let keep_ids = config.translation_position == "only";
         let restored = restore_markup(&candidate.node, translation, rules, keep_ids)?;
         inject_translation(&candidate.node, &restored, config)?;
         injected += 1;
     }
-    Ok((document.html().as_bytes().to_vec(), injected))
+    if injected == 0 {
+        return Ok((data.to_vec(), 0));
+    }
+    Ok((serialize_xhtml(&document, data)?, injected))
 }
 
 fn inject_translation(node: &NodeRef<'_>, restored: &str, config: &Config) -> Result<()> {
@@ -1248,34 +1309,56 @@ fn rewrite_metadata(
     position: &str,
     final_title: &str,
 ) -> Result<(Vec<u8>, usize)> {
-    let mut output = String::from_utf8_lossy(data).into_owned();
+    let mut reader = Reader::from_reader(data);
+    let mut writer = Writer::new(Vec::with_capacity(data.len()));
+    let mut occurrences = HashMap::<String, usize>::new();
+    let mut capture: Option<XmlCapture> = None;
     let mut injected = 0;
-    for field in METADATA_FIELDS {
-        let pattern = Regex::new(&format!(
-            r"(?is)(<(?:[A-Za-z_][\w.-]*:)?{field}\b[^>]*>)(.*?)(</(?:[A-Za-z_][\w.-]*:)?{field}\s*>)"
-        ))?;
-        let mut index = 0usize;
-        output = pattern
-            .replace_all(&output, |captures: &Captures<'_>| {
-                let uid = make_uid("metadata", resource, &format!("{field}:{index}"));
-                let original = decode_xml_text(&strip_markup(&captures[2])).unwrap_or_default();
+    loop {
+        let event = reader.read_event()?.into_owned();
+        if let Some(active) = &mut capture {
+            active.push(&event)?;
+            if active.depth == 0 {
+                let active = capture.take().unwrap();
+                let uid = make_uid(
+                    "metadata",
+                    resource,
+                    &format!("{}:{}", active.name, active.index),
+                );
                 let translation = translations.get(&uid);
                 if translation.is_some() {
                     injected += 1;
                 }
-                let value = if *field == "title" && index == 0 {
-                    final_title.to_owned()
-                } else if let Some(translation) = translation {
-                    combine_plain(&original, translation, position)
+                let replacement = if active.name == "title" && active.index == 0 {
+                    Some(final_title.to_owned())
                 } else {
-                    original
+                    translation.map(|translation| {
+                        combine_plain(&normalize_text(&active.text), translation, position)
+                    })
                 };
-                index += 1;
-                format!("{}{}{}", &captures[1], escape_xml(&value), &captures[3])
-            })
-            .into_owned();
+                active.write(&mut writer, replacement.as_deref())?;
+            }
+            continue;
+        }
+        match &event {
+            Event::Start(start) => {
+                let name = String::from_utf8_lossy(start.local_name().as_ref()).to_lowercase();
+                if METADATA_FIELDS.contains(&name.as_str()) {
+                    let index = *occurrences.entry(name.clone()).or_default();
+                    *occurrences.entry(name.clone()).or_default() += 1;
+                    capture = Some(XmlCapture::new(name, index, event));
+                    continue;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        writer.write_event(event)?;
     }
-    Ok((output.into_bytes(), injected))
+    if capture.is_some() {
+        bail!("OPF 元数据标签未闭合");
+    }
+    Ok((writer.into_inner(), injected))
 }
 
 fn rewrite_ncx(
@@ -1284,25 +1367,102 @@ fn rewrite_ncx(
     translations: &HashMap<String, String>,
     position: &str,
 ) -> Result<(Vec<u8>, usize)> {
-    let pattern = Regex::new(
-        r"(?is)(<(?:[A-Za-z_][\w.-]*:)?navLabel\b[^>]*>.*?<(?:[A-Za-z_][\w.-]*:)?text\b[^>]*>)(.*?)(</(?:[A-Za-z_][\w.-]*:)?text\s*>.*?</(?:[A-Za-z_][\w.-]*:)?navLabel\s*>)",
-    )?;
+    let mut reader = Reader::from_reader(data);
+    let mut writer = Writer::new(Vec::with_capacity(data.len()));
+    let mut in_label = false;
+    let mut capture: Option<XmlCapture> = None;
     let mut index = 0usize;
     let mut injected = 0;
-    let source = String::from_utf8_lossy(data);
-    let output = pattern.replace_all(&source, |captures: &Captures<'_>| {
-        let uid = make_uid("toc", resource, &index.to_string());
-        let original = decode_xml_text(&strip_markup(&captures[2])).unwrap_or_default();
-        let value = if let Some(translation) = translations.get(&uid) {
-            injected += 1;
-            combine_plain(&original, translation, position)
+    loop {
+        let event = reader.read_event()?.into_owned();
+        if let Some(active) = &mut capture {
+            active.push(&event)?;
+            if active.depth == 0 {
+                let active = capture.take().unwrap();
+                let original = normalize_text(&active.text);
+                if original.is_empty() {
+                    active.write(&mut writer, None)?;
+                } else {
+                    let uid = make_uid("toc", resource, &index.to_string());
+                    index += 1;
+                    if let Some(translation) = translations.get(&uid) {
+                        injected += 1;
+                        let value = combine_plain(&original, translation, position);
+                        active.write(&mut writer, Some(&value))?;
+                    } else {
+                        active.write(&mut writer, None)?;
+                    }
+                }
+            }
+            continue;
+        }
+        match &event {
+            Event::Start(start) if start.local_name().as_ref() == b"navLabel" => in_label = true,
+            Event::Start(start) if in_label && start.local_name().as_ref() == b"text" => {
+                capture = Some(XmlCapture::new("text".into(), index, event));
+                continue;
+            }
+            Event::End(end) if end.local_name().as_ref() == b"navLabel" => in_label = false,
+            Event::Eof => break,
+            _ => {}
+        }
+        writer.write_event(event)?;
+    }
+    if capture.is_some() {
+        bail!("NCX text 标签未闭合");
+    }
+    Ok((writer.into_inner(), injected))
+}
+
+struct XmlCapture {
+    name: String,
+    index: usize,
+    depth: usize,
+    text: String,
+    events: Vec<Event<'static>>,
+}
+
+impl XmlCapture {
+    fn new(name: String, index: usize, start: Event<'static>) -> Self {
+        Self {
+            name,
+            index,
+            depth: 1,
+            text: String::new(),
+            events: vec![start],
+        }
+    }
+
+    fn push(&mut self, event: &Event<'static>) -> Result<()> {
+        match event {
+            Event::Start(_) => self.depth += 1,
+            Event::End(_) => self.depth = self.depth.saturating_sub(1),
+            Event::Text(text) => self
+                .text
+                .push_str(&decode_xml_text(text.decode()?.as_ref())?),
+            Event::CData(text) => self.text.push_str(text.decode()?.as_ref()),
+            Event::GeneralRef(reference) => push_general_ref(&mut self.text, reference)?,
+            _ => {}
+        }
+        self.events.push(event.clone());
+        Ok(())
+    }
+
+    fn write(self, writer: &mut Writer<Vec<u8>>, replacement: Option<&str>) -> Result<()> {
+        if let Some(replacement) = replacement {
+            let mut events = self.events.into_iter();
+            let start = events.next().ok_or_else(|| anyhow!("XML capture 为空"))?;
+            let end = events.last().ok_or_else(|| anyhow!("XML 标签未闭合"))?;
+            writer.write_event(start)?;
+            writer.write_event(Event::Text(BytesText::new(replacement)))?;
+            writer.write_event(end)?;
         } else {
-            original
-        };
-        index += 1;
-        format!("{}{}{}", &captures[1], escape_xml(&value), &captures[3])
-    });
-    Ok((output.into_owned().into_bytes(), injected))
+            for event in self.events {
+                writer.write_event(event)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn inject_nav(
@@ -1311,7 +1471,7 @@ fn inject_nav(
     translations: &HashMap<String, String>,
     position: &str,
 ) -> Result<(Vec<u8>, usize)> {
-    let document = parse_page(data);
+    let document = parse_page(data)?;
     let nodes = nav_nodes(&document);
     let mut injected = 0;
     for (index, node) in nodes.into_iter().enumerate() {
@@ -1322,7 +1482,10 @@ fn inject_nav(
             injected += 1;
         }
     }
-    Ok((document.html().as_bytes().to_vec(), injected))
+    if injected == 0 {
+        return Ok((data.to_vec(), 0));
+    }
+    Ok((serialize_xhtml(&document, data)?, injected))
 }
 
 fn nav_nodes<'a>(document: &'a Document) -> Vec<NodeRef<'a>> {
@@ -1401,14 +1564,21 @@ pub fn resolve_href(base: &str, href: &str) -> String {
     parts.join("/")
 }
 
-fn parse_page(data: &[u8]) -> Document {
-    Document::from(strip_doctype(&String::from_utf8_lossy(data)))
+fn parse_page(data: &[u8]) -> Result<Document> {
+    Ok(Document::from(strip_doctype(&decode_page(data)?)))
 }
 
 fn strip_doctype(text: &str) -> String {
-    let Some(start) = text.to_ascii_lowercase().find("<!doctype") else {
+    let Some((start, end)) = doctype_range(text) else {
         return text.into();
     };
+    let mut output = text.to_owned();
+    output.replace_range(start..end, "");
+    output
+}
+
+fn doctype_range(text: &str) -> Option<(usize, usize)> {
+    let start = text.to_ascii_lowercase().find("<!doctype")?;
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut quote = None;
@@ -1429,13 +1599,122 @@ fn strip_doctype(text: &str) -> String {
                 depth = depth.saturating_sub(1);
             }
             if byte == b'>' && depth == 0 {
-                let mut output = text.to_owned();
-                output.replace_range(start..=index, "");
-                return output;
+                return Some((start, index + 1));
             }
         }
     }
-    text[..start].to_owned()
+    Some((start, text.len()))
+}
+
+fn decode_page(data: &[u8]) -> Result<String> {
+    if let Some(bytes) = data.strip_prefix(&[0xff, 0xfe]) {
+        if bytes.len() % 2 != 0 {
+            bail!("UTF-16LE XHTML 字节数无效");
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16(&units).context("UTF-16LE XHTML 无效");
+    }
+    if let Some(bytes) = data.strip_prefix(&[0xfe, 0xff]) {
+        if bytes.len() % 2 != 0 {
+            bail!("UTF-16BE XHTML 字节数无效");
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16(&units).context("UTF-16BE XHTML 无效");
+    }
+    Ok(
+        std::str::from_utf8(data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data))
+            .context("XHTML 不是有效的 UTF-8/UTF-16")?
+            .to_owned(),
+    )
+}
+
+fn serialize_xhtml(document: &Document, original: &[u8]) -> Result<Vec<u8>> {
+    let original = decode_page(original)?;
+    let mut output = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".to_vec();
+    if let Some((start, end)) = doctype_range(&original) {
+        output.extend_from_slice(&original.as_bytes()[start..end]);
+        output.push(b'\n');
+    }
+    let node: SerializableNodeRef<'_> = document.root().into();
+    node.serialize(&mut XmlSerializer(&mut output), TraversalScope::IncludeNode)?;
+    // Validate the exact bytes written before placing them back in the EPUB.
+    let mut reader = Reader::from_reader(output.as_slice());
+    loop {
+        if matches!(reader.read_event()?, Event::Eof) {
+            break;
+        }
+    }
+    Ok(output)
+}
+
+struct XmlSerializer<W: Write>(W);
+
+impl<W: Write> XmlSerializer<W> {
+    fn name(&mut self, name: &QualName) -> io::Result<()> {
+        if let Some(prefix) = &name.prefix {
+            write!(self.0, "{prefix}:")?;
+        }
+        self.0.write_all(name.local.as_bytes())
+    }
+
+    fn escaped(&mut self, value: &str, attribute: bool) -> io::Result<()> {
+        for character in value.chars() {
+            match character {
+                '&' => self.0.write_all(b"&amp;")?,
+                '<' => self.0.write_all(b"&lt;")?,
+                '>' => self.0.write_all(b"&gt;")?,
+                '"' if attribute => self.0.write_all(b"&quot;")?,
+                _ => write!(self.0, "{character}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Serializer for XmlSerializer<W> {
+    fn start_elem<'a, A>(&mut self, name: QualName, attrs: A) -> io::Result<()>
+    where
+        A: Iterator<Item = AttrRef<'a>>,
+    {
+        self.0.write_all(b"<")?;
+        self.name(&name)?;
+        for (name, value) in attrs {
+            self.0.write_all(b" ")?;
+            self.name(name)?;
+            self.0.write_all(b"=\"")?;
+            self.escaped(value, true)?;
+            self.0.write_all(b"\"")?;
+        }
+        self.0.write_all(b">")
+    }
+
+    fn end_elem(&mut self, name: QualName) -> io::Result<()> {
+        self.0.write_all(b"</")?;
+        self.name(&name)?;
+        self.0.write_all(b">")
+    }
+
+    fn write_text(&mut self, text: &str) -> io::Result<()> {
+        self.escaped(text, false)
+    }
+
+    fn write_comment(&mut self, text: &str) -> io::Result<()> {
+        write!(self.0, "<!--{text}-->")
+    }
+
+    fn write_doctype(&mut self, name: &str) -> io::Result<()> {
+        write!(self.0, "<!DOCTYPE {name}>")
+    }
+
+    fn write_processing_instruction(&mut self, target: &str, data: &str) -> io::Result<()> {
+        write!(self.0, "<?{target} {data}?>")
+    }
 }
 
 pub fn is_non_translatable(text: &str) -> bool {
@@ -1452,7 +1731,8 @@ pub fn is_non_translatable(text: &str) -> bool {
         || Regex::new(r"(?i)^(?:Figure|Fig\.?|Table)\s*[:#.]?\s*[A-Z0-9]+(?:[.\-][A-Z0-9]+)*[.:]?$")
             .unwrap()
             .is_match(value)
-        || Regex::new(r"^[\d,.\-+eE\s%]+$").unwrap().is_match(value)
+        || (value.chars().any(|character| character.is_ascii_digit())
+            && Regex::new(r"^[\d,.\-+eE\s%]+$").unwrap().is_match(value))
 }
 
 fn parse_set(value: &str) -> HashSet<String> {
@@ -1477,11 +1757,25 @@ fn decode_xml_text(value: &str) -> Result<String> {
     Ok(unescape(value)?.into_owned())
 }
 
-fn strip_markup(value: &str) -> String {
-    Regex::new(r"(?s)<[^>]+>")
-        .unwrap()
-        .replace_all(value, "")
-        .into_owned()
+fn push_general_ref(
+    output: &mut String,
+    reference: &quick_xml::events::BytesRef<'_>,
+) -> Result<()> {
+    if let Some(character) = reference.resolve_char_ref()? {
+        output.push(character);
+        return Ok(());
+    }
+    let name = reference.decode()?;
+    if let Some(value) = resolve_xml_entity(&name) {
+        output.push_str(value);
+    } else if name == "nbsp" {
+        output.push('\u{00a0}');
+    } else {
+        output.push('&');
+        output.push_str(&name);
+        output.push(';');
+    }
+    Ok(())
 }
 
 fn combine_plain(original: &str, translation: &str, position: &str) -> String {
@@ -1490,10 +1784,6 @@ fn combine_plain(original: &str, translation: &str, position: &str) -> String {
         "above" | "left" => format!("{} {}", translation.trim(), original.trim()),
         _ => format!("{} {}", original.trim(), translation.trim()),
     }
-}
-
-fn escape_xml(value: &str) -> String {
-    quick_xml::escape::escape(value).into_owned()
 }
 
 fn escape_html_text(value: &str) -> String {
@@ -1517,12 +1807,47 @@ fn sanitize_ids(value: &str, keep_ids: bool) -> String {
     if keep_ids {
         return value.into();
     }
-    let double = Regex::new(r#"(?i)\s+id\s*=\s*\"[^\"]*\""#).unwrap();
-    let single = Regex::new(r"(?i)\s+id\s*=\s*'[^']*'").unwrap();
-    let unquoted = Regex::new(r"(?i)\s+id\s*=\s*[^\s>]+").unwrap();
-    unquoted
-        .replace_all(&single.replace_all(&double.replace_all(value, ""), ""), "")
-        .into_owned()
+    let mut reader = Reader::from_str(value);
+    let mut writer = Writer::new(Vec::with_capacity(value.len()));
+    loop {
+        let event = match reader.read_event() {
+            Ok(Event::Start(start)) => Event::Start(without_id(start)),
+            Ok(Event::Empty(start)) => Event::Empty(without_id(start)),
+            Ok(Event::Eof) => break,
+            Ok(event) => event.into_owned(),
+            Err(_) => return value.into(),
+        };
+        if writer.write_event(event).is_err() {
+            return value.into();
+        }
+    }
+    String::from_utf8(writer.into_inner()).unwrap_or_else(|_| value.into())
+}
+
+fn without_id(start: quick_xml::events::BytesStart<'_>) -> quick_xml::events::BytesStart<'static> {
+    let attributes = start
+        .attributes()
+        .filter_map(|attribute| attribute.ok())
+        .filter(|attribute| {
+            !attribute
+                .key
+                .local_name()
+                .as_ref()
+                .eq_ignore_ascii_case(b"id")
+        })
+        .map(|attribute| {
+            (
+                attribute.key.as_ref().to_vec(),
+                attribute.value.into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut start = start.into_owned();
+    start.clear_attributes();
+    for (key, value) in &attributes {
+        start.push_attribute((key.as_slice(), value.as_slice()));
+    }
+    start
 }
 
 fn append_style(style: &mut String, value: &str) {
@@ -1659,6 +1984,106 @@ mod tests {
     }
 
     #[test]
+    fn xml_entities_and_event_based_rewrites_stay_aligned() {
+        let opf = br#"<?xml version='1.0'?><package><metadata>
+            <!--<dc:title xmlns:dc='x'>Draft</dc:title>-->
+            <dc:title xmlns:dc='x'>Tom &amp; Jerry &#8212; Book</dc:title>
+            <dc:creator xmlns:dc='x'/><dc:creator xmlns:dc='x'><![CDATA[Jane Doe]]></dc:creator>
+            </metadata></package>"#;
+        let package = parse_package(opf).unwrap();
+        assert_eq!(package.title, "Tom & Jerry — Book");
+        let config = Config {
+            metadata_translation: true,
+            ..Default::default()
+        };
+        let metadata = extract_metadata(opf, "content.opf", &config).unwrap();
+        assert!(
+            metadata
+                .iter()
+                .any(|item| item.original == "Tom & Jerry — Book")
+        );
+        assert!(metadata.iter().any(|item| item.original == "Jane Doe"));
+        let title = metadata
+            .iter()
+            .find(|item| item.raw_html == "title")
+            .unwrap();
+        let rewritten = rewrite_metadata(
+            opf,
+            "content.opf",
+            &[(title.uid.clone(), "汤姆与杰瑞".into())]
+                .into_iter()
+                .collect(),
+            "below",
+            "Tom & Jerry — Book 汤姆与杰瑞",
+        )
+        .unwrap()
+        .0;
+        let mut reader = Reader::from_reader(rewritten.as_slice());
+        while !matches!(reader.read_event().unwrap(), Event::Eof) {}
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(rewritten.contains("<!--<dc:title"));
+        assert!(rewritten.contains("<dc:creator xmlns:dc='x'/><dc:creator"));
+
+        let ncx = br#"<ncx><navMap>
+            <navPoint><navLabel><text> </text></navLabel></navPoint>
+            <navPoint><navLabel><text>One &amp; Two</text></navLabel></navPoint>
+            </navMap></ncx>"#;
+        let toc = extract_ncx(ncx, "toc.ncx").unwrap();
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].original, "One & Two");
+        let (rewritten, count) = rewrite_ncx(
+            ncx,
+            "toc.ncx",
+            &[(toc[0].uid.clone(), "一和二".into())]
+                .into_iter()
+                .collect(),
+            "only",
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            String::from_utf8(rewritten)
+                .unwrap()
+                .contains("<text>一和二</text>")
+        );
+
+        let package = Package {
+            manifest: vec![ManifestItem {
+                id: "c".into(),
+                href: "c.xhtml".into(),
+                media_type: "application/xhtml+xml".into(),
+                properties: HashSet::new(),
+            }],
+            spine: vec!["c.xhtml".into(), "c.xhtml".into()],
+            ..Default::default()
+        };
+        assert_eq!(ordered_content_items(&package, None, None).len(), 1);
+    }
+
+    #[test]
+    fn xhtml_write_preserves_doctype_and_is_well_formed_xml() {
+        let data = br#"<!DOCTYPE html><html xmlns='http://www.w3.org/1999/xhtml'><body><p>A&nbsp;B<br/>C</p></body></html>"#;
+        let config = Config::default();
+        let rules = Rules::new(&config).unwrap();
+        let elements = extract_body(data, "c.xhtml", &rules).unwrap();
+        let body = elements.first().unwrap();
+        let translation = body.original.replace("A B", "甲乙").replace('C', "丙");
+        let (output, count) = inject_body(
+            data,
+            "c.xhtml",
+            &[(body.uid.clone(), translation)].into_iter().collect(),
+            &config,
+            &rules,
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(output.windows(15).any(|part| part == b"<!DOCTYPE html>"));
+        assert!(!output.windows(6).any(|part| part == b"&nbsp;"));
+        let mut reader = Reader::from_reader(output.as_slice());
+        while !matches!(reader.read_event().unwrap(), Event::Eof) {}
+    }
+
+    #[test]
     fn writes_sibling_clone_without_duplicate_ids() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.epub");
@@ -1697,6 +2122,10 @@ mod tests {
         assert_eq!(
             normalize_markup_tokens("{{ etm _ o _ 0 0 0 0 0 }}x{{etm_c_00000}}"),
             "{{etm_o_00000}}x{{etm_c_00000}}"
+        );
+        assert_eq!(
+            normalize_markup_tokens("{{ etm _ n _ 1 0 0 0 0 0 }}"),
+            "{{etm_n_100000}}"
         );
         assert_eq!(
             accept_markup_translation("{{etm_o_00000}}Hello{{etm_c_00000}}", "你好").unwrap(),
@@ -1829,7 +2258,7 @@ mod tests {
             assert!(html.contains("lang=\"ar-EG\""));
             assert!(html.contains("dir=\"rtl\""));
             assert!(html.contains("color:green"));
-            assert!(html.contains("<br>ثان"));
+            assert!(html.contains("<br></br>ثان"));
             assert_eq!(html.matches("id=\"p\"").count(), 1);
             if matches!(position, "left" | "right") {
                 assert!(html.contains("et-translation-table"));

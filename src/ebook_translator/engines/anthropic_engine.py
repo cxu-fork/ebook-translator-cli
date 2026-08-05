@@ -36,7 +36,7 @@ class AnthropicEngine(TranslationEngine):
 
     def _body(self, text: str, prompt: str, stream: bool) -> dict:
         extra = dict(self.config.extra)
-        max_tokens = extra.pop("max_tokens", 4096)
+        max_tokens = extra.pop("max_tokens", 64_000)
         conflicts = self._reserved_extra.intersection(extra)
         if conflicts:
             raise ValueError(
@@ -48,9 +48,9 @@ class AnthropicEngine(TranslationEngine):
             "system": prompt,
             "messages": [{"role": "user", "content": text}],
         }
-        if self.temperature is not None:
+        if self.config.sampling == "temperature" and self.temperature is not None:
             body["temperature"] = self.temperature
-        if self.config.top_p is not None:
+        if self.config.sampling == "top_p" and self.config.top_p is not None:
             body["top_p"] = self.config.top_p
         if stream:
             body["stream"] = True

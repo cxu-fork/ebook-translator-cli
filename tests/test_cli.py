@@ -171,7 +171,7 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             cli.main([str(books), str(self.tmp / "out")])
 
-        self.assertEqual(2, ctx.exception.code)
+        self.assertEqual(1, ctx.exception.code)
 
     def test_main_rejects_output_directory_symlink_to_input_directory(self):
         books = self.tmp / "books-link-source"
@@ -187,7 +187,7 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             cli.main([str(book), str(output_link), "-o", "epub"])
 
-        self.assertEqual(2, ctx.exception.code)
+        self.assertEqual(1, ctx.exception.code)
 
     def test_glossary_uses_longest_terms_first_and_restores_spaced_tokens(self):
         path = self.tmp / "glossary.txt"
@@ -209,6 +209,43 @@ class CliTests(unittest.TestCase):
             "AI模型 beats 人工智能",
             glossary.restore(spaced),
         )
+
+    def test_glossary_single_line_protects_and_inline_overrides(self):
+        path = self.tmp / "glossary-single.txt"
+        path.write_text("OpenAI\n\nAI\nold\n", encoding="utf-8")
+        glossary = cli.Glossary(str(path), {"AI": "人工智能", "": "bad"})
+        self.assertEqual(
+            "OpenAI 人工智能",
+            glossary.restore(glossary.apply("OpenAI AI")),
+        )
+
+    def test_merge_truncation_falls_back_to_individual_requests(self):
+        calls: list[str] = []
+
+        class TruncatedMergeEngine:
+            def translate(self, text: str, prompt: str = "") -> str:
+                calls.append(text)
+                if text.strip().startswith("["):
+                    raise RuntimeError("API 输出被截断 (finish_reason=length)")
+                return f"译文 {text}"
+
+        cache = TranslationCache(str(self.tmp / "merge-truncated.db"))
+        paras = [Para("0", "one"), Para("1", "two")]
+        cache.save_paragraphs([
+            (p.id, p.id, "", p.original, False, None, None) for p in paras
+        ])
+        cfg = Config(engine="openai", merge_enabled=True, merge_length=100)
+        cfg.engines["openai"] = EngineConfig(
+            api_key="x", max_retries=1, request_interval=0,
+        )
+        worker = cli.TranslationWorker(
+            TruncatedMergeEngine(), cache, cfg, cli.Glossary(""))
+
+        self.assertEqual(
+            (2, 0), asyncio.run(worker.translate_batch(paras, concurrency=1, interval=0))
+        )
+        self.assertEqual(3, len(calls))
+        cache.close()
 
     def test_glossary_does_not_replace_inside_its_own_placeholder(self):
         path = self.tmp / "glossary_tokens.txt"

@@ -67,6 +67,7 @@ impl RateLimiter {
 
 pub struct TranslationWorker {
     engine: Arc<Engine>,
+    fallback: Vec<Arc<Engine>>,
     cache: Arc<TranslationCache>,
     config: Arc<Config>,
     glossary: Arc<Glossary>,
@@ -90,6 +91,7 @@ impl TranslationWorker {
             .clamp(1, MAX_CONCURRENCY);
         Self {
             engine: Arc::new(engine),
+            fallback: Vec::new(),
             cache,
             config: Arc::new(config),
             glossary: Arc::new(glossary),
@@ -100,12 +102,33 @@ impl TranslationWorker {
         }
     }
 
+
+
+    pub fn with_fallback(mut self, engine: Engine) -> Self {
+        self.fallback.push(Arc::new(engine));
+        self
+    }
+
+    fn message(&self, message: impl AsRef<str>) {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(&mut stderr, "{}", message.as_ref());
+        let _ = stderr.flush();
+    }
+
+    fn record_failure(&self) {
+        // ponytail: never stop the whole batch on repeated failures; each
+        // paragraph independently exhausts primary + fallback chain.
+        let _ = self.abort_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn translate_batch(&self, paragraphs: Vec<Paragraph>) -> (usize, usize) {
         let groups = merge_groups(
             &paragraphs,
             self.config.merge_enabled,
             self.config.merge_length,
         );
+        let total_groups = groups.len();
         let mut tasks = FuturesUnordered::new();
         for group in groups {
             tasks.push(async move {
@@ -119,50 +142,61 @@ impl TranslationWorker {
         }
         let mut done = 0;
         let mut failed = 0;
+        let mut last_heartbeat = Instant::now();
         while let Some((group, result)) = tasks.next().await {
-            if self.stopped.load(Ordering::Relaxed) {
-                failed += group.len();
-                continue;
+            if done > 0 && done % 25 == 0 {
+                let now = Instant::now();
+                if now.duration_since(last_heartbeat) >= Duration::from_secs(30) {
+                    self.message(format!(
+                        "  进度: {done}/{total_groups} 段, 失败 {failed}"
+                    ));
+                    last_heartbeat = now;
+                }
             }
             match result {
                 Ok(translations) => {
                     let updates = group
                         .iter()
                         .map(|paragraph| {
-                            let translation =
-                                translations.get(&paragraph.id).cloned().unwrap_or_default();
-                            (
-                                paragraph.id.clone(),
-                                translation,
-                                self.config.engine.clone(),
-                                self.config.target_lang.clone(),
-                            )
+                            translations
+                                .get(&paragraph.id)
+                                .filter(|value| !value.trim().is_empty())
+                                .cloned()
+                                .map(|translation| {
+                                    (
+                                        paragraph.id.clone(),
+                                        translation,
+                                        self.config.engine.clone(),
+                                        self.config.target_lang.clone(),
+                                    )
+                                })
                         })
-                        .collect::<Vec<_>>();
-                    if updates.iter().any(|x| x.1.trim().is_empty())
-                        || self.cache.update_translations(&updates).is_err()
-                    {
-                        failed += group.len();
-                    } else {
-                        done += group.len();
-                        self.abort_count.store(0, Ordering::Relaxed);
+                        .collect::<Option<Vec<_>>>();
+                    let saved = updates
+                        .ok_or_else(|| anyhow!("合并翻译缺少段落或返回空译文"))
+                        .and_then(|updates| self.cache.update_translations(&updates));
+                    match saved {
+                        Ok(()) => {
+                            done += group.len();
+                            self.abort_count.store(0, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            failed += group.len();
+                            self.message(format!("  缓存写入失败: {error:#}"));
+                            self.record_failure();
+                        }
                     }
                 }
                 Err(error) => {
                     failed += group.len();
-                    eprintln!(
+                    self.message(format!(
                         "  翻译失败: {} -> {error:#}",
                         group
                             .first()
                             .map(|x| x.original.chars().take(60).collect::<String>())
                             .unwrap_or_default()
-                    );
-                    if !self.config.skip_failed {
-                        let count = self.abort_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        if self.config.max_error_count > 0 && count >= self.config.max_error_count {
-                            self.stopped.store(true, Ordering::Relaxed);
-                        }
-                    }
+                    ));
+                    self.record_failure();
                 }
             }
         }
@@ -178,7 +212,8 @@ impl TranslationWorker {
             )]
             .into());
         }
-        // ponytail: markup-bearing paragraphs never merge; free models drop tokens under multi-paragraph prompts
+        // ponytail: use simple double-newline separator instead of JSON merge —
+        // free models handle plain text far more reliably than structured JSON
         let original = group
             .iter()
             .map(|paragraph| self.glossary.apply(&paragraph.original))
@@ -193,32 +228,18 @@ impl TranslationWorker {
             .collect::<Vec<_>>();
         if parts.len() == group.len() {
             let mut translations = HashMap::new();
-            let mut valid = true;
             for (paragraph, translation) in group.iter().zip(parts) {
-                match accept_markup_translation(
-                    &paragraph.original,
-                    &self.glossary.restore(translation),
-                ) {
-                    Ok(translation) => {
-                        translations.insert(paragraph.id.clone(), translation);
-                    }
-                    Err(_) => {
-                        valid = false;
-                        break;
-                    }
-                }
+                let restored = self.glossary.restore(&paragraph.original, translation)?;
+                let translation = accept_markup_translation(&paragraph.original, &restored)?;
+                translations.insert(paragraph.id.clone(), translation);
             }
-            if valid {
-                return Ok(translations);
-            }
-            eprintln!("  合并翻译损坏 HTML 占位符，回退逐段");
-        } else {
-            eprintln!(
-                "  合并翻译段落数不匹配（预期 {}, 实际 {}），回退逐段",
-                group.len(),
-                parts.len()
-            );
+            return Ok(translations);
         }
+        self.message(format!(
+            "  合并翻译段落数不匹配（预期 {}, 实际 {}），回退逐段",
+            group.len(),
+            parts.len()
+        ));
         let mut fallback = HashMap::new();
         for paragraph in group {
             fallback.insert(
@@ -231,15 +252,93 @@ impl TranslationWorker {
 
     async fn translate_paragraph(&self, paragraph: &Paragraph) -> Result<String> {
         let original = self.glossary.apply(&paragraph.original);
-        let has_tokens = paragraph.original.contains("{{etm_");
-        let prompt = markup_prompt(self.config.effective_prompt(), has_tokens);
-        for attempt in 0..=usize::from(has_tokens) {
-            let result = self.translate_one(&original, &prompt).await?;
-            let restored = self.glossary.restore(result.trim());
+        if self.fallback.is_empty() {
+            // No fallback: keep a hard deadline so one paragraph cannot stall the batch.
+            tokio::time::timeout(
+                Duration::from_secs(180),
+                self.translate_paragraph_inner(paragraph, &original),
+            )
+            .await
+            .map_err(|_| anyhow!("段落翻译超时（180 秒）"))?
+        } else {
+            // With a fallback chain, the last fallback retries forever by design.
+            self.translate_paragraph_inner(paragraph, &original).await
+        }
+    }
+
+    async fn translate_paragraph_inner(
+        &self,
+        paragraph: &Paragraph,
+        original: &str,
+    ) -> Result<String> {
+        let mut last_error = match self
+            .translate_paragraph_with(&self.engine, paragraph, original)
+            .await
+        {
+            Ok(translation) => return Ok(translation),
+            Err(error) => error,
+        };
+        let total = self.fallback.len();
+        for (index, fallback) in self.fallback.iter().enumerate() {
+            self.message(format!(
+                "  渠道 {} 失败，使用兜底渠道 #{}: {last_error:#}",
+                index + 1,
+                index + 2
+            ));
+            match self
+                .translate_paragraph_with(fallback, paragraph, original)
+                .await
+            {
+                Ok(translation) => return Ok(translation),
+                Err(error) => last_error = error,
+            }
+            // The LAST fallback must never give up: retry forever until it
+            // produces a valid translation. It is slow but reliable by design.
+            if index + 1 == total {
+                self.message(format!(
+                    "  最后兜底渠道失败，无限重试: {last_error:#}"
+                ));
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match self
+                        .translate_paragraph_with(fallback, paragraph, original)
+                        .await
+                    {
+                        Ok(translation) => return Ok(translation),
+                        Err(error) => {
+                            last_error = error;
+                            self.message(format!("  最后兜底渠道重试失败: {last_error:#}"));
+                        }
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    async fn translate_paragraph_with(
+        &self,
+        engine: &Engine,
+        paragraph: &Paragraph,
+        original: &str,
+    ) -> Result<String> {
+        let has_markup = paragraph.original.contains("{{etm_");
+        let has_glossary = original.contains("{{etg_");
+        let prompt = protected_prompt(self.config.effective_prompt(), has_markup, has_glossary);
+        for attempt in 0..=usize::from(has_markup || has_glossary) {
+            let result = self.translate_one_with(engine, original, &prompt).await?;
+            let restored = match self.glossary.restore(original, result.trim()) {
+                Ok(restored) => restored,
+                Err(error) if attempt == 0 => {
+                    self.message(format!("  模型损坏术语占位符，自动重试一次: {error}"));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match accept_markup_translation(&paragraph.original, &restored) {
                 Ok(translation) => return Ok(translation),
-                Err(error) if attempt == 0 && has_tokens => {
-                    eprintln!("  模型损坏 HTML 占位符，自动重试一次: {error}");
+                Err(error) if attempt == 0 && has_markup => {
+                    self.message(format!("  模型损坏 HTML 占位符，自动重试一次: {error}"));
                 }
                 Err(error) => return Err(error),
             }
@@ -248,6 +347,15 @@ impl TranslationWorker {
     }
 
     async fn translate_one(&self, text: &str, prompt: &str) -> Result<String> {
+        self.translate_one_with(&self.engine, text, prompt).await
+    }
+
+    async fn translate_one_with(
+        &self,
+        engine: &Engine,
+        text: &str,
+        prompt: &str,
+    ) -> Result<String> {
         let config = self.config.engine_config(None);
         for attempt in 1..=config.max_retries.max(1) {
             self.limiter.acquire(&self.stopped).await?;
@@ -256,7 +364,14 @@ impl TranslationWorker {
                 drop(permit);
                 bail!("翻译批次已停止");
             }
-            let translated = self.engine.translate(text, prompt).await;
+            // Hard cap each HTTP attempt so a hung gateway cannot stall a paragraph forever.
+            let attempt_timeout = Duration::from_secs_f64(
+                config.request_timeout.clamp(10.0, 60.0),
+            );
+            let translated = tokio::time::timeout(attempt_timeout, engine.translate(text, prompt))
+                .await
+                .map_err(|_| anyhow!("请求超时（{attempt_timeout:?}）"))
+                .and_then(|result| result);
             drop(permit);
             match translated {
                 Ok(result) if !result.trim().is_empty() => return Ok(result),
@@ -265,10 +380,10 @@ impl TranslationWorker {
                     if attempt >= allowed {
                         bail!("API 返回空译文");
                     }
-                    tokio::time::sleep(Duration::from_secs_f64(
+                    self.sleep_or_stop(Duration::from_secs_f64(
                         config.retry_delay.min(2.0) * attempt as f64,
                     ))
-                    .await;
+                    .await?;
                 }
                 Err(error) => {
                     let kind = classify_error(&error);
@@ -285,39 +400,63 @@ impl TranslationWorker {
                         .chain()
                         .find_map(|x| x.downcast_ref::<ApiError>())
                         .and_then(|x| x.retry_after);
+                    let server_wait = retry_after;
                     let base = match kind {
-                        ErrorKind::RateLimit => retry_after.unwrap_or(Duration::from_secs_f64(
-                            config.retry_delay * 2.0 * attempt as f64,
-                        )),
+                        ErrorKind::RateLimit => {
+                            Duration::from_secs_f64(config.retry_delay * 2.0 * attempt as f64)
+                        }
                         ErrorKind::Empty => {
                             Duration::from_secs_f64(config.retry_delay.min(2.0) * attempt as f64)
                         }
                         _ => Duration::from_secs_f64(config.retry_delay * attempt as f64),
                     };
-                    let wait = if retry_after.is_some() {
-                        base
+                    let wait = if let Some(wait) = server_wait {
+                        wait
                     } else {
                         base.mul_f64(rand::rng().random_range(0.5..1.5))
                     };
                     if kind == ErrorKind::RateLimit {
                         self.limiter.defer(wait).await;
                     }
-                    tokio::time::sleep(wait).await;
+                    self.sleep_or_stop(wait).await?;
                 }
             }
         }
         bail!("翻译失败")
     }
+
+    async fn sleep_or_stop(&self, wait: Duration) -> Result<()> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if self.stopped.load(Ordering::Relaxed) {
+                bail!("翻译批次已停止");
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(250))).await;
+        }
+    }
 }
 
-fn markup_prompt(prompt: &str, has_tokens: bool) -> String {
-    if !has_tokens {
+fn protected_prompt(prompt: &str, has_markup: bool, has_glossary: bool) -> String {
+    if !has_markup && !has_glossary {
         return prompt.into();
     }
+    let mut tokens = Vec::new();
+    if has_markup {
+        tokens.push("HTML tokens such as {{etm_o_00000}}, {{etm_c_00000}}, and {{etm_n_00000}}");
+    }
+    if has_glossary {
+        tokens.push("glossary tokens such as {{etg_0123456789ab_000000}}");
+    }
     format!(
-        "{prompt}\n\nThe input may contain immutable HTML placeholder tokens such as {{{{etm_o_00000}}}}, {{{{etm_c_00000}}}}, and {{{{etm_n_00000}}}}. Copy every such token exactly once, character-for-character, in the same order and nesting. Never translate, alter, add, remove, split, or surround these tokens with spaces. Translate only the human-readable text between them."
+        "{prompt}\n\nThe input contains immutable {}. Copy every token exactly once, character-for-character, in the same order. Never translate, alter, add, remove, split, or surround these tokens with spaces. Translate only the human-readable text between them.",
+        tokens.join(" and ")
     )
 }
+
 
 fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Vec<Paragraph>> {
     if !enabled || limit == 0 {
@@ -354,10 +493,7 @@ fn classify_error(error: &anyhow::Error) -> ErrorKind {
         if api.status == Some(429) {
             return ErrorKind::RateLimit;
         }
-        if api
-            .status
-            .is_some_and(|x| (400..500).contains(&x) && !matches!(x, 408 | 409 | 425))
-        {
+        if matches!(api.status, Some(401) | Some(403)) {
             return ErrorKind::Permanent;
         }
     }
@@ -461,9 +597,10 @@ mod tests {
             validate_markup_tokens(original, "{{etm_c_00000}}{{etm_o_00000}}{{etm_n_00001}}")
                 .is_err()
         );
-        let prompt = markup_prompt("translate", true);
-        assert!(prompt.contains("Copy every such token exactly once"));
-        assert_eq!(markup_prompt("translate", false), "translate");
+        let prompt = protected_prompt("translate", true, false);
+        assert!(prompt.contains("Copy every token exactly once"));
+        assert_eq!(protected_prompt("translate", false, false), "translate");
+        assert!(protected_prompt("translate", false, true).contains("glossary tokens"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -557,7 +694,7 @@ mod tests {
         server.join().unwrap();
         assert_eq!(result, "{{etm_o_00000}}译文{{etm_c_00000}}");
         assert_eq!(requests.lock().unwrap().len(), 1);
-        assert!(requests.lock().unwrap()[0].contains("immutable HTML placeholder"));
+        assert!(requests.lock().unwrap()[0].contains("immutable HTML tokens"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -567,7 +704,7 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server_captured = captured.clone();
         let server = thread::spawn(move || {
-            for response in ["只返回一段", "甲", "乙"] {
+            for response in [r#"[{"id":"0","text":"只返回一段"}]"#, "甲", "乙"] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -660,7 +797,7 @@ mod tests {
         assert_eq!(result["b"], "乙");
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests[0].contains(r"one\n\ntwo"));
+        assert!(requests[0].contains("one\\n\\ntwo"));
         assert!(requests[0].contains("detected language"));
     }
 }

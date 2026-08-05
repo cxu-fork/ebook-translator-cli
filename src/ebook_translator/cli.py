@@ -48,6 +48,12 @@ def _c(text: str, *codes: str) -> str:
     return "".join(codes) + text + _RESET
 
 
+def _c_stdout(text: str, *codes: str) -> str:
+    if not sys.stdout.isatty():
+        return text
+    return "".join(codes) + text + _RESET
+
+
 # ---------------------------------------------------------------------------
 
 def _err(msg, *pbars):
@@ -160,12 +166,19 @@ class _RateLimiter:
 # 术语表
 # ---------------------------------------------------------------------------
 class Glossary:
-    def __init__(self, path: str = ""):
+    def __init__(self, path: str = "", inline: dict[str, str] | None = None):
         self.pairs: list[tuple[str, str]] = []
         if path:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"术语表文件不存在: {Path(path).resolve()}")
             self._load(path)
+        values = dict(self.pairs)
+        values.update({
+            source.strip(): target.strip()
+            for source, target in (inline or {}).items()
+            if source.strip()
+        })
+        self.pairs = sorted(values.items(), key=lambda pair: len(pair[0]), reverse=True)
         self._source_ids: dict[str, int] = {}
         for i, (src, _tgt) in enumerate(self.pairs):
             self._source_ids.setdefault(src, i)
@@ -189,13 +202,9 @@ class Glossary:
                 continue
             lines = group.split("\n")
             src = lines[0].strip()
-            if len(lines) < 2:
-                logging.warning("术语表条目缺少翻译行，已跳过: %r", src)
-                continue
-            tgt = lines[1].strip()
+            tgt = lines[1].strip() if len(lines) >= 2 else src
             if src:
                 self.pairs.append((src, tgt))
-        self.pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
     def apply(self, text: str) -> str:
         if self._source_pattern is None:
@@ -232,15 +241,16 @@ def _build_cache_key(input_path: str, elements: list, config: Config,
     # merge_enabled / merge_length only affect request batching, not translation
     # identity. Keep them out so batching changes reuse per-paragraph progress.
     payload = {
-        "cache_version": 4,
+        "cache_version": 5,
         "source_content_md5": _file_md5(input_path),
         "element_signature": element_sig,
         "engine": config.engine,
         "source_lang": config.source_lang,
         "target_lang": config.target_lang,
-        "prompt": config.prompt,
+        "prompt": config.effective_prompt(),
         "model": engine_cfg.model,
         "base_url": engine_cfg.base_url,
+        "sampling": engine_cfg.sampling,
         "temperature": engine_cfg.temperature,
         "top_p": engine_cfg.top_p,
         "extra": engine_cfg.extra,
@@ -286,7 +296,7 @@ class TranslationWorker:
         engine_cfg = self.config.get_engine()
         max_retries = max(1, int(engine_cfg.max_retries or 1))
         retry_delay = engine_cfg.retry_delay
-        prompt = prompt if prompt is not None else self.config.prompt
+        prompt = prompt if prompt is not None else self.config.effective_prompt()
 
         for attempt in range(1, max_retries + 1):
             self._rate_limiter.acquire(self._stop_event)
@@ -353,7 +363,7 @@ class TranslationWorker:
 
     def _merge_prompt(self) -> str:
         return (
-            self.config.prompt
+            self.config.effective_prompt()
             + "\n\nYou will receive a JSON array of segments. Translate each "
               "segment text independently and preserve all segment ids. Return "
               "only valid JSON in this exact shape: "
@@ -414,21 +424,28 @@ class TranslationWorker:
         payload = json.dumps(segments, ensure_ascii=False)
         expected_ids = {str(i) for i in range(len(group))}
 
-        response = self._translate_one(payload, prompt=self._merge_prompt())
         try:
+            response = self._translate_one(payload, prompt=self._merge_prompt())
             merged = self._parse_merged_result(response, expected_ids)
         except (json.JSONDecodeError, ValueError) as e:
             logging.warning("合并翻译解析失败，回退逐段: %s", e)
-            fallback: dict[str, str] = {}
-            for para in group:
-                text = self.glossary.apply(para.original)
-                result = self._translate_one(text)
-                fallback[para.id] = self.glossary.restore(result).strip()
-            return fallback
-        return {
-            para.id: self.glossary.restore(merged[str(i)]).strip()
-            for i, para in enumerate(group)
-        }
+        except RuntimeError as e:
+            if not any(token in str(e).lower() for token in (
+                "输出被截断", "内容过滤", "content_filter", "max_tokens", "refusal",
+            )):
+                raise
+            logging.warning("合并翻译输出受限，回退逐段: %s", e)
+        else:
+            return {
+                para.id: self.glossary.restore(merged[str(i)]).strip()
+                for i, para in enumerate(group)
+            }
+        fallback: dict[str, str] = {}
+        for para in group:
+            text = self.glossary.apply(para.original)
+            result = self._translate_one(text)
+            fallback[para.id] = self.glossary.restore(result).strip()
+        return fallback
 
     async def translate_batch(self, paragraphs: list, concurrency: int = 3,
                               interval: float = 1.0):
@@ -567,6 +584,40 @@ def translate_book(
     book_pbar=None,
     overall_pbar=None,
 ):
+    resources: dict[str, object] = {}
+    try:
+        return _translate_book_impl(
+            input_path, output_path, output_format, config, glossary,
+            book_pbar, overall_pbar, resources,
+        )
+    finally:
+        cache = resources.get("cache")
+        if cache is not None:
+            try:
+                cache.close()
+            except Exception:
+                pass
+        translated = resources.get("translated_epub")
+        if isinstance(translated, str) and os.path.exists(translated):
+            try:
+                os.remove(translated)
+            except OSError:
+                pass
+        tmp_epub = resources.get("tmp_epub")
+        if isinstance(tmp_epub, str):
+            _cleanup(tmp_epub)
+
+
+def _translate_book_impl(
+    input_path: str,
+    output_path: str,
+    output_format: str,
+    config: Config,
+    glossary: Glossary,
+    book_pbar=None,
+    overall_pbar=None,
+    _resources: dict[str, object] | None = None,
+):
     """完整流程：提取 -> 翻译 -> 注入 -> 转换。"""
     from tqdm import tqdm
 
@@ -595,6 +646,8 @@ def translate_book(
         try:
             tmp_epub = convert_to_epub(input_path, config.ebook_convert_path)
             working_epub = tmp_epub
+            if _resources is not None:
+                _resources["tmp_epub"] = tmp_epub
         except ConverterError as e:
             _err(f"格式转换失败: {e}", book_pbar, overall_pbar)
             return False
@@ -615,8 +668,8 @@ def translate_book(
         return False
 
     if not elements:
-        if book_pbar:
-            book_pbar.write(_c("  ✗ 未找到可翻译内容", _YELLOW))
+        _status(_c("  ✗ 未找到可翻译内容", _YELLOW))
+        logging.warning("未找到可翻译内容: %s", input_path)
         _cleanup(tmp_epub)
         return False
 
@@ -633,6 +686,8 @@ def translate_book(
     else:
         cache = TranslationCache(":memory:", persistence=False)
         logging.info("缓存已禁用: 使用内存缓存")
+    if _resources is not None:
+        _resources["cache"] = cache
     cache.set_info("title", title)
     cache.set_info("engine", config.engine)
     cache.set_info("target_lang", config.target_lang)
@@ -642,7 +697,7 @@ def translate_book(
     cache.save_paragraphs(rows)
 
     # --- Retranslate mode: clear specific paragraph translations ---
-    if config.retranslate_file and config.retranslate_start:
+    if config.retranslate_start:
         _do_retranslate(cache, config)
 
     untranslated = cache.get_untranslated()
@@ -679,7 +734,7 @@ def translate_book(
             desc=trans_desc,
             unit="段",
             leave=False,
-            position=1 if book_pbar else 0,
+            position=1 if (book_pbar or overall_pbar) else 0,
             ncols=80,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
@@ -766,6 +821,8 @@ def translate_book(
         prefix=f".{book_name}_", suffix=".epub", dir=output_dir)
     os.close(fd)
     os.remove(translated_epub)
+    if _resources is not None:
+        _resources["translated_epub"] = translated_epub
     try:
         injected = write_translated_epub(
             working_epub, translated_epub, trans_map,
@@ -839,7 +896,8 @@ def collect_books(input_path: str) -> list[str]:
     if p.is_dir():
         books: list[str] = []
         for f in sorted(p.iterdir()):
-            if f.is_file() and f.suffix.lstrip(".").lower() in SUPPORTED_INPUT_FORMATS:
+            if (f.is_file() and not f.name.startswith(".")
+                    and f.suffix.lstrip(".").lower() in SUPPORTED_INPUT_FORMATS):
                 books.append(str(f))
         return books
     return []
@@ -880,7 +938,7 @@ def main(argv: list[str] | None = None):
         config = _apply_overrides(args)
     except (OSError, ValueError, TypeError) as e:
         print(_c("配置错误: ", _RED) + str(e), file=sys.stderr)
-        raise SystemExit(2) from e
+        raise SystemExit(1) from e
 
     # 设置日志
     if config.log_file:
@@ -892,6 +950,8 @@ def main(argv: list[str] | None = None):
             force=True,
         )
         logging.info("启动 ebook-translator v%s", __version__)
+    else:
+        logging.basicConfig(handlers=[logging.NullHandler()], force=True)
 
     # 打印 banner
     if sys.stderr.isatty():
@@ -917,9 +977,9 @@ def main(argv: list[str] | None = None):
     output_format = args.output_format.lower()
     # 预览模式
     if args.dry_run:
-        print(_c(f"\n找到 {len(books)} 本书:\n", _BOLD))
+        print(_c_stdout(f"\n找到 {len(books)} 本书:\n", _BOLD))
         for b in books:
-            print(f"  {Path(b).name}  {_c(f'({_human_size(b)})', _DIM)}")
+            print(f"  {Path(b).name}  {_c_stdout(f'({_human_size(b)})', _DIM)}")
             logging.info("dry-run: %s", b)
         print()
         return
@@ -935,17 +995,24 @@ def main(argv: list[str] | None = None):
                 + f"输入文件输出名冲突: {output_paths[out_path]} 和 {book}",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(1)
         if os.path.realpath(book) == out_path:
             print(
                 _c("错误: ", _RED) + f"拒绝覆盖输入文件: {book}",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(1)
         output_paths[out_path] = book
 
     # 检查输出目录
-    os.makedirs(args.output, exist_ok=True)
+    try:
+        os.makedirs(args.output, exist_ok=True)
+    except OSError as e:
+        print(
+            _c("错误: ", _RED) + f"无法创建输出目录 {args.output}: {e}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from e
     if not os.access(args.output, os.W_OK):
         logging.error("输出目录无写入权限: %s", args.output)
         print(_c("错误: ", _RED) + f"输出目录无写入权限: {args.output}", file=sys.stderr)
@@ -953,10 +1020,10 @@ def main(argv: list[str] | None = None):
 
     # 加载术语表
     try:
-        glossary = Glossary(config.glossary_path)
+        glossary = Glossary(config.glossary_path, config.glossary)
     except OSError as e:
         print(_c("配置错误: ", _RED) + str(e), file=sys.stderr)
-        raise SystemExit(2) from e
+        raise SystemExit(1) from e
     if glossary.pairs:
         if sys.stderr.isatty():
             print(_c(f"  术语表: {len(glossary.pairs)} 条", _DIM), file=sys.stderr)
@@ -1008,57 +1075,49 @@ def main(argv: list[str] | None = None):
 
     batch_start = time.time()
 
-    for book_path in books:
-        if interrupted:
-            break
+    try:
+        for book_path in books:
+            if interrupted:
+                break
 
-        stem = Path(book_path).stem
-        out_path = os.path.join(args.output, f"{stem}.{output_format}")
+            stem = Path(book_path).stem
+            out_path = os.path.join(args.output, f"{stem}.{output_format}")
+            book_result = {
+                "name": stem,
+                "input": book_path,
+                "output": out_path,
+                "success": False,
+                "skipped": False,
+            }
 
-        book_result = {
-            "name": stem,
-            "input": book_path,
-            "output": out_path,
-            "success": False,
-            "skipped": False,
-        }
+            if os.path.exists(out_path) and not args.force:
+                logging.info("跳过已有输出: %s", out_path)
+                overall_pbar.write(
+                    f"  ⏭ 跳过: {stem}"
+                    + _c(" (输出文件已存在，使用 --force 覆盖)", _DIM)
+                )
+                book_result["skipped"] = True
+            else:
+                try:
+                    ok = translate_book(
+                        book_path, out_path, output_format, config, glossary,
+                        book_pbar=None,
+                        overall_pbar=overall_pbar,
+                    )
+                    book_result["success"] = ok
+                    logging.info("书籍结果: %s success=%s", book_path, ok)
+                except Exception as e:
+                    _err(f"处理失败 {stem}: {e}", overall_pbar)
+                    logging.exception("处理失败: %s", book_path)
 
-        # 检查输出是否已存在
-        if os.path.exists(out_path) and not args.force:
-            logging.info("跳过已有输出: %s", out_path)
-            overall_pbar.write(
-                f"  ⏭ 跳过: {stem}"
-                + _c(f" (输出文件已存在，使用 --force 覆盖)", _DIM)
-            )
-            book_result["skipped"] = True
             results.append(book_result)
             overall_pbar.update(1)
-            continue
-
-        try:
-            ok = translate_book(
-                book_path, out_path, output_format, config, glossary,
-                book_pbar=None,
-                overall_pbar=overall_pbar,
-            )
-            book_result["success"] = ok
-            logging.info("书籍结果: %s success=%s", book_path, ok)
-        except KeyboardInterrupt:
-            interrupted = True
-            book_result["success"] = False
-            logging.warning("收到中断: %s", book_path)
-        except Exception as e:
-            _err(f"处理失败 {stem}: {e}", overall_pbar)
-            book_result["success"] = False
-            logging.exception("处理失败: %s", book_path)
-
-        results.append(book_result)
-        overall_pbar.update(1)
-
-    overall_pbar.close()
-
-    # 恢复信号处理
-    signal.signal(signal.SIGINT, original_handler)
+    except KeyboardInterrupt:
+        interrupted = True
+        logging.warning("批处理被中断")
+    finally:
+        overall_pbar.close()
+        signal.signal(signal.SIGINT, original_handler)
 
     # 打印摘要
     batch_elapsed = time.time() - batch_start
@@ -1219,5 +1278,13 @@ def _apply_overrides(args: argparse.Namespace) -> Config:
         config.retranslate_start = args.retranslate_start
     if args.retranslate_end:
         config.retranslate_end = args.retranslate_end
+
+    values = (
+        config.retranslate_file.strip(),
+        config.retranslate_start.strip(),
+        config.retranslate_end.strip(),
+    )
+    if any(values) and not values[1]:
+        raise ValueError("重翻译必须设置 retranslate_start")
 
     return config

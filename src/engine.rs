@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, Response, Url};
+use reqwest::{Client, Response, Url, redirect};
 use serde_json::{Map, Value, json};
 
 use crate::config::EngineConfig;
@@ -16,6 +16,7 @@ pub enum EngineKind {
     OpenAi,
     DeepSeek,
     Claude,
+    DeepLx,
 }
 
 #[derive(Debug)]
@@ -69,15 +70,22 @@ impl Engine {
                 "/v1/messages",
                 "claude-sonnet-4-20250514",
             ),
+            "deeplx" | "deepx" => (
+                EngineKind::DeepLx,
+                "http://127.0.0.1:1188",
+                "/translate",
+                "",
+            ),
             _ => bail!("未知翻译引擎: {name}"),
         };
-        if config.api_key.is_empty() {
+        if config.api_key.is_empty() && !matches!(kind, EngineKind::DeepLx) {
             bail!(
                 "{} 引擎需要设置 api_key",
-                if kind == EngineKind::Claude {
-                    "Anthropic"
-                } else {
-                    "OpenAI"
+                match kind {
+                    EngineKind::Claude => "Anthropic",
+                    EngineKind::DeepSeek => "DeepSeek",
+                    EngineKind::OpenAi => "OpenAI",
+                    EngineKind::DeepLx => "DeepLX",
                 }
             );
         }
@@ -89,15 +97,34 @@ impl Engine {
         let endpoint = endpoint_url(base, suffix)?;
         let model = if !config.model.is_empty() {
             config.model.clone()
-        } else if config.base_url.is_empty() || base.trim_end_matches('/') == default_base {
+        } else if config.base_url.is_empty()
+            || endpoint.host_str() == Url::parse(default_base)?.host_str()
+        {
             default_model.into()
         } else {
             String::new()
         };
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs_f64(config.request_timeout))
+            .timeout(Duration::try_from_secs_f64(config.request_timeout).unwrap_or(Duration::MAX))
             .pool_max_idle_per_host(config.concurrency.max(4))
+            .redirect(redirect::Policy::custom(|attempt| {
+                // API key 位于自定义头(x-api-key),reqwest 跨主机重定向不会剥离,
+                // 因此仅允许同 origin 重定向。
+                if attempt.previous().len() > 10 {
+                    return attempt.error("重定向次数过多");
+                }
+                let same_origin = attempt.previous().last().is_some_and(|prev| {
+                    prev.scheme() == attempt.url().scheme()
+                        && prev.host_str() == attempt.url().host_str()
+                        && prev.port_or_known_default() == attempt.url().port_or_known_default()
+                });
+                if same_origin {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
             .build()?;
         Ok(Self {
             kind,
@@ -111,6 +138,9 @@ impl Engine {
     }
 
     pub async fn translate(&self, text: &str, prompt: &str) -> Result<String> {
+        if matches!(self.kind, EngineKind::DeepLx) {
+            return self.translate_deeplx(text).await;
+        }
         let source_lang = if matches!(
             self.source_lang.trim().to_ascii_lowercase().as_str(),
             "auto" | "auto detect" | "auto-detect"
@@ -142,10 +172,83 @@ impl Engine {
             self.parse_response(response.json().await?).await?
         };
         let result = result.trim().to_owned();
-        if result.is_empty() {
-            bail!("API 返回空译文");
+        if !result.is_empty() {
+            return Ok(result);
         }
-        Ok(result)
+        // content 为空时，很多模型把译文写进 reasoning_content，或把思考参数理解
+        // 不一致。健壮兜底：依次用不同的"关思考"参数重试，最后才从 reasoning 提取。
+        for strategy in thinking_disable_strategies() {
+            let mut retry_body = body.clone();
+            apply_thinking_strategy(&mut retry_body, strategy);
+            let response = self
+                .client
+                .post(self.endpoint.clone())
+                .json(&retry_body)
+                .header("content-type", "application/json")
+                .send()
+                .await?;
+            let response = check_status(response).await?;
+            let result = if self.config.stream {
+                self.parse_stream(response).await?
+            } else {
+                self.parse_response(response.json().await?).await?
+            };
+            let result = result.trim().to_owned();
+            if !result.is_empty() {
+                return Ok(result);
+            }
+        }
+        bail!("API 返回空译文")
+    }
+
+    async fn translate_deeplx(&self, text: &str) -> Result<String> {
+        let body = serde_json::json!({
+            "text": text,
+            "source_lang": deepl_lang(&self.source_lang),
+            "target_lang": deepl_lang(&self.target_lang),
+        });
+        let mut request = self
+            .client
+            .post(self.endpoint.clone())
+            .json(&body)
+            .header("content-type", "application/json")
+            // Cloudflare checks browser fingerprints; a plain reqwest UA gets 403/1010.
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            )
+            .header("accept", "application/json");
+        if let Some(host) = self.endpoint.host_str() {
+            request = request.header("origin", format!("https://{host}"));
+            request = request.header("referer", format!("https://{host}/"));
+        }
+        if !self.config.api_key.is_empty() {
+            request = request.header("authorization", format!("Bearer {}", self.config.api_key));
+        }
+        let response = request.send().await?;
+        let response = check_status(response).await?;
+        let data: Value = response.json().await?;
+        let text = data
+            .get("data")
+            .and_then(|data| match data {
+                Value::String(value) => Some(value.as_str()),
+                _ => data
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        data.get("translations")
+                            .and_then(Value::as_array)
+                            .and_then(|items| items.first())
+                            .and_then(|item| item.get("text").and_then(Value::as_str))
+                    }),
+            })
+            .or_else(|| data.get("text").and_then(Value::as_str))
+            .ok_or_else(|| anyhow!("DeepLX 返回格式无法识别: {}", truncate_json(&data)))?;
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            bail!("DeepLX 返回空译文");
+        }
+        Ok(text)
     }
 
     pub fn body(&self, text: &str, prompt: &str, stream: bool) -> Result<Value> {
@@ -175,7 +278,9 @@ impl Engine {
         let mut body = Map::new();
         match self.kind {
             EngineKind::Claude => {
-                body.insert("model".into(), json!(self.model));
+                if !self.model.is_empty() {
+                    body.insert("model".into(), json!(self.model));
+                }
                 body.insert(
                     "max_tokens".into(),
                     self.config
@@ -254,12 +359,21 @@ impl Engine {
                 if message.get("refusal").is_some_and(|x| !x.is_null()) {
                     bail!("API 输出被内容过滤 (refusal)");
                 }
-                message
+                let content = message
                     .get("content")
                     .and_then(Value::as_str)
                     .filter(|x| !x.is_empty())
-                    .or_else(|| choice.get("text").and_then(Value::as_str))
                     .map(str::to_owned)
+                    .or_else(|| {
+                        // GLM 网关有时把译文写进 reasoning_content 而 content 为空
+                        message
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .map(extract_tail_translation)
+                    })
+                    .or_else(|| choice.get("text").and_then(Value::as_str).map(str::to_owned));
+                content
+                    .filter(|x| !x.trim().is_empty())
                     .ok_or_else(|| anyhow!("API 返回空译文: {}", truncate_json(&data)))
             }
         }
@@ -267,16 +381,22 @@ impl Engine {
 
     async fn parse_stream(&self, response: Response) -> Result<String> {
         let mut bytes = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
         let mut pending = String::new();
         let mut output = String::new();
         let mut completed = false;
         while let Some(chunk) = bytes.next().await {
-            pending.push_str(std::str::from_utf8(&chunk?).context("API 流式响应不是 UTF-8")?);
+            // 网络分块边界可能落在多字节 UTF-8 序列中间,残缺尾部留在 buf 等下一块。
+            buf.extend_from_slice(&chunk?);
+            drain_valid_utf8(&mut buf, &mut pending)?;
             while let Some(pos) = pending.find('\n') {
                 let line = pending[..pos].trim_end_matches('\r').trim().to_owned();
                 pending.drain(..=pos);
                 parse_sse_line(self.kind, &line, &mut output, &mut completed)?;
             }
+        }
+        if !buf.is_empty() {
+            bail!("API 流式响应不是 UTF-8");
         }
         if !pending.trim().is_empty() {
             parse_sse_line(
@@ -291,6 +411,43 @@ impl Engine {
         }
         Ok(output)
     }
+}
+
+fn apply_thinking_strategy(body: &mut Value, strategy: &str) {
+    let Value::Object(map) = body else {
+        return;
+    };
+    match strategy {
+        "thinking_disabled" => {
+            map.insert("thinking".into(), json!({"type": "disabled"}));
+            map.remove("reasoning_effort");
+            map.remove("enable_thinking");
+        }
+        "reasoning_none" => {
+            map.insert("reasoning_effort".into(), json!("none"));
+            map.remove("thinking");
+            map.remove("enable_thinking");
+        }
+        "enable_thinking_false" => {
+            map.insert("enable_thinking".into(), json!(false));
+            map.remove("thinking");
+            map.remove("reasoning_effort");
+        }
+        _ => {
+            map.remove("thinking");
+            map.remove("reasoning_effort");
+            map.remove("enable_thinking");
+        }
+    }
+}
+
+fn thinking_disable_strategies() -> Vec<&'static str> {
+    vec![
+        "thinking_disabled",
+        "reasoning_none",
+        "enable_thinking_false",
+        "none",
+    ]
 }
 
 fn parse_sse_line(
@@ -314,6 +471,33 @@ fn parse_sse_line(
     }
 }
 
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(300);
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value
+        .parse::<f64>()
+        .ok()
+        // Retry-After 由服务器控制,负数/NaN/inf/超大值都必须拒绝而非 panic。
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .and_then(|at| at.duration_since(SystemTime::now()).ok())
+        })
+        .map(|delay| delay.min(RETRY_AFTER_MAX))
+}
+
+fn drain_valid_utf8(buf: &mut Vec<u8>, pending: &mut String) -> Result<()> {
+    let valid_len = match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        Err(err) => return Err(err).context("API 流式响应不是 UTF-8"),
+    };
+    pending.push_str(std::str::from_utf8(&buf[..valid_len]).unwrap());
+    buf.drain(..valid_len);
+    Ok(())
+}
+
 async fn check_status(response: Response) -> Result<Response> {
     if response.status().is_success() {
         return Ok(response);
@@ -323,17 +507,7 @@ async fn check_status(response: Response) -> Result<Response> {
         .headers()
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value
-                .parse::<f64>()
-                .ok()
-                .map(Duration::from_secs_f64)
-                .or_else(|| {
-                    httpdate::parse_http_date(value)
-                        .ok()
-                        .and_then(|at| at.duration_since(SystemTime::now()).ok())
-                })
-        });
+        .and_then(parse_retry_after);
     let body = response.text().await.unwrap_or_default();
     Err(ApiError {
         status: Some(status),
@@ -346,7 +520,124 @@ async fn check_status(response: Response) -> Result<Response> {
     .into())
 }
 
-pub fn endpoint_url(base: &str, suffix: &str) -> Result<Url> {
+fn extract_tail_translation(reasoning: &str) -> String {
+    // reasoning_content 末尾通常是模型给出的最终译文，常混有"只输出译文"的英文说明。
+    // 真实形态: "...without any explanations.在我看来，这似乎和茶很相似"
+    // 优先取最后一个英文句点后含非 ASCII 文本的部分；否则取末尾连续非 ASCII 段。
+    let trimmed = reasoning.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 1) 最后一个 ASCII 句点后跟非 ASCII 文本 => 取句点后的部分
+    for (idx, b) in trimmed.bytes().enumerate().rev() {
+        if b == b'.' {
+            let tail = trimmed[idx + 1..].trim();
+            if !tail.is_ascii() {
+                return tail.to_owned();
+            }
+        }
+    }
+    // 2) 取末尾最后一段连续非 ASCII 文本
+    let last_non_ascii = trimmed
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !c.is_ascii())
+        .map(|(idx, c)| idx + c.len_utf8());
+    if let Some(last_end) = last_non_ascii {
+        let mut start = last_end;
+        while start > 0 {
+            let prev = trimmed[..start].chars().next_back().unwrap();
+            if prev.is_ascii() && !matches!(prev, ' ' | '.' | ',' | ';' | ':' | '-' | '—') {
+                break;
+            }
+            start -= prev.len_utf8();
+        }
+        return trimmed[start..].trim().to_owned();
+    }
+    trimmed.to_owned()
+}
+pub fn deepl_lang(language: &str) -> String {
+    let normalized = language.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "auto" | "auto detect" | "auto-detect" | "auto_detect"
+    ) {
+        return "auto".to_owned();
+    }
+    let code = normalized.split(['-', '_']).next().unwrap_or("").to_owned();
+    let english = normalized
+        .replace([' ', '-', '_'], "")
+        .replace("chinese", "zh")
+        .replace("english", "en")
+        .replace("japanese", "ja")
+        .replace("korean", "ko")
+        .replace("french", "fr")
+        .replace("german", "de")
+        .replace("spanish", "es")
+        .replace("portuguese", "pt")
+        .replace("italian", "it")
+        .replace("russian", "ru")
+        .replace("arabic", "ar")
+        .replace("dutch", "nl")
+        .replace("polish", "pl")
+        .replace("turkish", "tr")
+        .replace("vietnamese", "vi")
+        .replace("indonesian", "id")
+        .replace("thai", "th")
+        .replace("hindi", "hi")
+        .replace("ukrainian", "uk")
+        .replace("greek", "el")
+        .replace("swedish", "sv")
+        .replace("norwegian", "nb")
+        .replace("finnish", "fi")
+        .replace("czech", "cs")
+        .replace("romanian", "ro")
+        .replace("hungarian", "hu")
+        .replace("bulgarian", "bg")
+        .replace("danish", "da")
+        .replace("slovak", "sk")
+        .replace("slovenian", "sl")
+        .replace("lithuanian", "lt")
+        .replace("latvian", "lv")
+        .replace("estonian", "et")
+        .replace("croatian", "hr")
+        .replace("serbian", "sr")
+        .replace("hebrew", "he")
+        .replace("persian", "fa")
+        .replace("urdu", "ur")
+        .replace("bengali", "bn")
+        .replace("tamil", "ta")
+        .replace("malay", "ms")
+        .replace("catalan", "ca")
+        .replace("welsh", "cy")
+        .replace("中文", "zh")
+        .replace("英语", "en")
+        .replace("日语", "ja")
+        .replace("韩语", "ko");
+    let code = if code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic()) {
+        code
+    } else {
+        english
+    };
+    if matches!(
+        code.as_str(),
+        "zh" | "en" | "ja" | "ko" | "fr" | "de" | "es" | "pt" | "it" | "ru" | "ar" | "nl"
+            | "pl" | "tr" | "vi" | "id" | "th" | "hi" | "uk" | "el" | "sv" | "nb" | "fi"
+            | "cs" | "ro" | "hu" | "bg" | "da" | "sk" | "sl" | "lt" | "lv" | "et" | "hr"
+            | "sr" | "he" | "fa" | "ur" | "bn" | "ta" | "ms" | "ca" | "cy"
+    ) {
+        code.to_ascii_uppercase()
+    } else if code.eq_ignore_ascii_case("auto")
+        || code.eq_ignore_ascii_case("auto detect")
+        || code.eq_ignore_ascii_case("auto-detect")
+    {
+        "auto".to_owned()
+    } else {
+        "EN".to_owned()
+    }
+}
+
+fn endpoint_url(base: &str, suffix: &str) -> Result<Url> {
     let mut url = Url::parse(base).with_context(|| format!("API base_url 无效: {base}"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         bail!("API base_url 无效: {base}");
@@ -385,9 +676,10 @@ fn parse_openai_event(event: &Value, output: &mut String, completed: &mut bool) 
         }
         bail!("API 流式响应缺少 choices");
     };
-    let choice = choices
-        .first()
-        .ok_or_else(|| anyhow!("API 流式响应缺少 choices"))?;
+    // usage chunk(include_usage)与 Azure 首个 prompt_filter chunk 的 choices 为空数组。
+    let Some(choice) = choices.first() else {
+        return Ok(());
+    };
     check_openai_finish(choice)?;
     if choice.get("finish_reason").is_some_and(|x| !x.is_null()) {
         *completed = true;
@@ -399,7 +691,8 @@ fn parse_openai_event(event: &Value, output: &mut String, completed: &mut bool) 
     if delta.get("refusal").is_some_and(|x| !x.is_null()) {
         bail!("API 输出被内容过滤 (refusal)");
     }
-    if let Some(value) = delta.get("content") {
+    // deepseek-reasoner 等模型在 reasoning 阶段发送 "content": null,跳过而非报错。
+    if let Some(value) = delta.get("content").filter(|value| !value.is_null()) {
         output.push_str(
             value
                 .as_str()
@@ -485,6 +778,58 @@ mod tests {
     }
 
     #[test]
+    fn thinking_strategies_toggle_all_variants() {
+        let mut body = json!({"model": "free", "messages": []});
+        apply_thinking_strategy(&mut body, "thinking_disabled");
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(body.get("reasoning_effort").is_none());
+        apply_thinking_strategy(&mut body, "reasoning_none");
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        assert!(body.get("thinking").is_none());
+        apply_thinking_strategy(&mut body, "enable_thinking_false");
+        assert_eq!(body["enable_thinking"], json!(false));
+        apply_thinking_strategy(&mut body, "none");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn reasoning_content_tail_is_extracted() {
+        let reasoning = r#"The given content is in German. Let me translate it to Chinese:
+"Ich bin munter" translates to "我还是精神抖擞的".
+I'll provide only the translation as requested.我还是精神抖擞的"#;
+        assert_eq!(extract_tail_translation(reasoning), "我还是精神抖擞的");
+        assert_eq!(extract_tail_translation("abc"), "abc");
+    }
+
+    #[test]
+    fn deeplx_string_data_response_is_supported() {
+        let engine = Engine::new(
+            "deeplx",
+            EngineConfig {
+                api_key: String::new(),
+                base_url: "http://127.0.0.1:1188".into(),
+                ..Default::default()
+            },
+            "auto",
+            "Chinese",
+        )
+        .unwrap();
+        assert_eq!(engine.kind, EngineKind::DeepLx);
+    }
+
+    #[test]
+    fn deepl_lang_maps_common_languages() {
+        assert_eq!(deepl_lang("Chinese"), "ZH");
+        assert_eq!(deepl_lang("Auto"), "auto");
+        assert_eq!(deepl_lang("auto-detect"), "auto");
+        assert_eq!(deepl_lang("English"), "EN");
+        assert_eq!(deepl_lang("日本語"), "EN");
+        assert_eq!(deepl_lang("ja"), "JA");
+    }
+
+    #[test]
     fn deepseek_defaults_are_distinct() {
         let engine = Engine::new("deepseek", cfg(""), "en", "zh").unwrap();
         assert_eq!(engine.model, "deepseek-chat");
@@ -492,5 +837,94 @@ mod tests {
             engine.endpoint.as_str(),
             "https://api.deepseek.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn missing_api_key_names_the_right_engine() {
+        let err = Engine::new("deepseek", EngineConfig::default(), "en", "zh")
+            .err()
+            .expect("缺少 api_key 应当报错");
+        assert!(err.to_string().contains("DeepSeek"));
+        let err = Engine::new("claude", EngineConfig::default(), "en", "zh")
+            .err()
+            .expect("缺少 api_key 应当报错");
+        assert!(err.to_string().contains("Anthropic"));
+    }
+
+    #[test]
+    fn official_url_variants_keep_default_model() {
+        let engine =
+            Engine::new("claude", cfg("https://api.anthropic.com/v1"), "en", "zh").unwrap();
+        assert_eq!(engine.model, "claude-sonnet-4-20250514");
+        let engine = Engine::new("openai", cfg("https://api.openai.com/v1/"), "en", "zh").unwrap();
+        assert_eq!(engine.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn claude_custom_endpoint_omits_empty_model() {
+        let engine = Engine::new("claude", cfg("https://x/v1"), "en", "zh").unwrap();
+        assert!(engine.model.is_empty());
+        assert!(engine.body("x", "p", false).unwrap().get("model").is_none());
+    }
+
+    #[test]
+    fn retry_after_rejects_invalid_values_and_caps() {
+        assert_eq!(parse_retry_after("3"), Some(Duration::from_secs(3)));
+        assert_eq!(parse_retry_after("-1"), None);
+        assert_eq!(parse_retry_after("NaN"), None);
+        assert_eq!(parse_retry_after("inf"), None);
+        assert_eq!(parse_retry_after("1e300"), None);
+        assert_eq!(parse_retry_after("10000"), Some(RETRY_AFTER_MAX));
+        let far = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(100_000));
+        assert_eq!(parse_retry_after(&far), Some(RETRY_AFTER_MAX));
+    }
+
+    #[test]
+    fn stream_null_content_delta_is_skipped() {
+        let mut output = String::new();
+        let mut completed = false;
+        let event: Value = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":null,"reasoning_content":"想"}}]}"#,
+        )
+        .unwrap();
+        parse_openai_event(&event, &mut output, &mut completed).unwrap();
+        assert!(output.is_empty());
+        let event: Value =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"好"}}]}"#).unwrap();
+        parse_openai_event(&event, &mut output, &mut completed).unwrap();
+        assert_eq!(output, "好");
+    }
+
+    #[test]
+    fn stream_empty_choices_chunk_is_tolerated() {
+        let mut output = String::new();
+        let mut completed = false;
+        for raw in [
+            r#"{"choices":[],"usage":{"total_tokens":1}}"#,
+            r#"{"choices":[],"prompt_filter_results":[]}"#,
+            r#"{"usage":{"total_tokens":1}}"#,
+        ] {
+            let event: Value = serde_json::from_str(raw).unwrap();
+            parse_openai_event(&event, &mut output, &mut completed).unwrap();
+        }
+        assert!(output.is_empty());
+        assert!(!completed);
+    }
+
+    #[test]
+    fn utf8_split_across_chunks_is_buffered() {
+        let text = "汉字".as_bytes();
+        let mut buf = Vec::new();
+        let mut pending = String::new();
+        buf.extend_from_slice(&text[..4]);
+        drain_valid_utf8(&mut buf, &mut pending).unwrap();
+        assert_eq!(pending, "汉");
+        assert_eq!(buf.len(), 1);
+        buf.extend_from_slice(&text[4..]);
+        drain_valid_utf8(&mut buf, &mut pending).unwrap();
+        assert_eq!(pending, "汉字");
+        assert!(buf.is_empty());
+        buf.push(0xFF);
+        assert!(drain_valid_utf8(&mut buf, &mut pending).is_err());
     }
 }

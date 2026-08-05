@@ -2,10 +2,8 @@ use std::{
     env,
     ffi::{c_char, c_int},
     fs,
-    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    thread,
     time::Duration,
 };
 
@@ -15,10 +13,21 @@ use wait_timeout::ChildExt;
 
 use crate::fsutil::replace;
 
+#[cfg(not(windows))]
 unsafe extern "C" {
     fn et_mobi_to_epub(
         input: *const c_char,
         output: *const c_char,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn et_mobi_to_epub_w(
+        input: *const u16,
+        output: *const u16,
         error: *mut c_char,
         error_size: usize,
     ) -> c_int;
@@ -108,20 +117,45 @@ fn mobi_to_epub_file(input: &Path, output: &Path) -> Result<()> {
     }
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let temp = NamedTempFile::new_in(parent)?;
-    let input = std::ffi::CString::new(input.as_os_str().as_encoded_bytes())?;
     let generated_path = temp.path().to_owned();
     drop(temp);
-    let generated = std::ffi::CString::new(generated_path.as_os_str().as_encoded_bytes())?;
-    let mut error = vec![0i8; 1024];
+    let mut error = vec![0 as c_char; 1024];
     // SAFETY: all pointers remain valid for the duration of the call; the error
     // buffer is writable and its exact length is supplied.
-    let status = unsafe {
-        et_mobi_to_epub(
-            input.as_ptr(),
-            generated.as_ptr(),
-            error.as_mut_ptr(),
-            error.len(),
-        )
+    #[cfg(not(windows))]
+    let status = {
+        let input = std::ffi::CString::new(input.as_os_str().as_encoded_bytes())?;
+        let generated = std::ffi::CString::new(generated_path.as_os_str().as_encoded_bytes())?;
+        unsafe {
+            et_mobi_to_epub(
+                input.as_ptr(),
+                generated.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        }
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::ffi::OsStrExt;
+        let input = input
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let generated = generated_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            et_mobi_to_epub_w(
+                input.as_ptr(),
+                generated.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        }
     };
     if status != 0 {
         let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
@@ -150,41 +184,35 @@ pub fn ebook_convert(
         .unwrap_or(output_format);
     let temp_output = temp_dir.path().join(format!("output.{suffix}"));
     let mut command = Command::new(&binary);
-    command.arg(input).arg(&temp_output);
+    command.arg(input.canonicalize()?).arg(&temp_output);
     if let Some(encoding) = input_encoding {
         command.arg("--input-encoding").arg(encoding);
     }
-    if matches!(output_format, "epub" | "mobi" | "azw3") {
-        command.arg("--enable-heuristics");
+    let stdout = NamedTempFile::new()?;
+    let stderr = NamedTempFile::new()?;
+    command
+        .stdout(Stdio::from(stdout.reopen()?))
+        .stderr(Stdio::from(stderr.reopen()?));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("无法运行 ebook-convert: {}", binary.display()))?;
-    let stdout = child.stdout.take().map(|mut stream| {
-        thread::spawn(move || {
-            let mut data = Vec::new();
-            let _ = stream.read_to_end(&mut data);
-            data
-        })
-    });
-    let stderr = child.stderr.take().map(|mut stream| {
-        thread::spawn(move || {
-            let mut data = Vec::new();
-            let _ = stream.read_to_end(&mut data);
-            data
-        })
-    });
-    let status = match child.wait_timeout(Duration::from_secs(300))? {
-        Some(status) => status,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
+    let status = match child.wait_timeout(Duration::from_secs(300)) {
+        Err(error) => {
+            kill_process_tree(&mut child);
+            return Err(error.into());
+        }
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            kill_process_tree(&mut child);
             bail!("ebook-convert 超时 (300秒): {}", input.display());
         }
     };
-    let _stdout = stdout.and_then(|x| x.join().ok()).unwrap_or_default();
-    let stderr = stderr.and_then(|x| x.join().ok()).unwrap_or_default();
+    let stderr = fs::read(stderr.path()).unwrap_or_default();
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let tail = stderr
@@ -245,9 +273,41 @@ pub fn find_ebook_convert(custom: &Path) -> Result<PathBuf> {
 
 fn find_on_path(name: &Path) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    let extensions = if cfg!(windows) && name.extension().is_none() {
+        env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".exe".into(), ".cmd".into(), ".bat".into()])
+    } else {
+        vec![String::new()]
+    };
+    env::split_paths(&path).find_map(|dir| {
+        extensions
+            .iter()
+            .map(|extension| dir.join(format!("{}{extension}", name.to_string_lossy())))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]

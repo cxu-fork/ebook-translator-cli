@@ -2,6 +2,7 @@
 import json
 import threading
 from typing import Generator
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,7 +23,9 @@ class OpenAIEngine(TranslationEngine):
         self.base_url = (config.base_url or self.default_base).rstrip("/")
         self.chat_url = endpoint_url(self.base_url, "/chat/completions")
         self.model = config.model or (
-            self.default_model if self.base_url == self.default_base else ""
+            self.default_model
+            if urlsplit(self.base_url).hostname == urlsplit(self.default_base).hostname
+            else ""
         )
         self.api_key = config.api_key
         if not self.api_key:
@@ -45,11 +48,11 @@ class OpenAIEngine(TranslationEngine):
                 {"role": "user", "content": text},
             ],
         }
-        if self.temperature is not None:
+        if self.config.sampling == "temperature" and self.temperature is not None:
             body["temperature"] = self.temperature
         if self.model:
             body["model"] = self.model
-        if self.config.top_p is not None:
+        if self.config.sampling == "top_p" and self.config.top_p is not None:
             body["top_p"] = self.config.top_p
         if stream:
             body["stream"] = True

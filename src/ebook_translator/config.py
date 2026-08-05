@@ -8,7 +8,7 @@ from typing import Any
 
 
 _KNOWN_ENGINES = {"openai", "claude", "deepseek"}
-MAX_CONCURRENCY = 32
+MAX_CONCURRENCY = 256
 
 DEFAULT_PROMPT = (
     "You are a meticulous translator who translates any given content. "
@@ -45,6 +45,8 @@ class EngineConfig:
     max_retries: int = 5
     retry_delay: float = 5.0
     stream: bool = False
+    prompt: str | None = None
+    sampling: str = "temperature"
     extra: dict = field(default_factory=dict)
 
 
@@ -57,7 +59,7 @@ class Config:
     prompt: str = DEFAULT_PROMPT
     cache_enabled: bool = True
     cache_dir: str = ""
-    merge_enabled: bool = True
+    merge_enabled: bool = False
     merge_length: int = 1800
     translation_position: str = "below"  # below, above, only
     translation_style: str = ""
@@ -71,6 +73,7 @@ class Config:
     retranslate_start: str = ""
     retranslate_end: str = ""
     glossary_path: str = ""
+    glossary: dict[str, str] = field(default_factory=dict)
     ebook_convert_path: str = ""
     max_error_count: int = 10
     skip_failed: bool = False
@@ -81,18 +84,27 @@ class Config:
         name = name or self.engine
         return self.engines.get(name, EngineConfig())
 
+    def effective_prompt(self) -> str:
+        return self.get_engine().prompt or self.prompt
+
 
 def _build_engine(raw: dict) -> EngineConfig:
     kw: dict[str, Any] = {}
     for k in (
         "api_key", "base_url", "model", "temperature", "top_p",
         "concurrency", "request_interval", "request_timeout",
-        "max_retries", "retry_delay", "stream",
+        "max_retries", "retry_delay", "stream", "prompt", "sampling",
     ):
         if k in raw:
             kw[k] = raw[k]
     extra = dict(raw.get("extra", {}))
-    extra.update({k: v for k, v in raw.items() if k not in kw and k != "extra"})
+    if "max_tokens" in raw:
+        if "max_tokens" in extra:
+            raise ValueError("max_tokens 不能同时平铺并写入 extra")
+        extra["max_tokens"] = raw["max_tokens"]
+    unknown = set(raw) - set(kw) - {"extra", "max_tokens"}
+    if unknown:
+        raise ValueError(f"引擎配置包含未知字段: {sorted(unknown)}")
     return EngineConfig(**kw, extra=extra)
 
 
@@ -107,7 +119,9 @@ def _validate_engine(name: str, raw: Any):
         raise ValueError(f"未知引擎 '{name}'，可用: {sorted(_KNOWN_ENGINES)}")
     if not isinstance(raw, dict):
         raise ValueError(f"引擎配置 {name} 必须是对象")
-    _expect_type(raw, ("api_key", "base_url", "model"), str)
+    _expect_type(raw, ("api_key", "base_url", "model", "sampling"), str)
+    if "prompt" in raw and raw["prompt"] is not None and not isinstance(raw["prompt"], str):
+        raise ValueError(f"引擎配置 {name}.prompt 必须是字符串或 null")
     _expect_type(raw, ("concurrency", "max_retries"), int)
     _expect_type(raw, ("stream",), bool)
     for key in ("temperature", "top_p", "request_interval", "request_timeout", "retry_delay"):
@@ -143,6 +157,8 @@ def _validate_engine(name: str, raw: Any):
     max_tokens = raw.get("max_tokens", extra.get("max_tokens"))
     if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 1):
         raise ValueError(f"引擎配置 {name}.max_tokens 必须是正整数")
+    if raw.get("sampling", "temperature") not in {"temperature", "top_p"}:
+        raise ValueError(f"引擎配置 {name}.sampling 必须是 temperature 或 top_p")
 
 
 def _validate_root(raw: Any):
@@ -173,6 +189,8 @@ def _validate_root(raw: Any):
     for name in _KNOWN_ENGINES:
         if name in raw:
             _validate_engine(name, raw[name])
+    if "glossary" in raw and not isinstance(raw["glossary"], dict):
+        raise ValueError("配置项 glossary 必须是对象")
 
 
 def load_config(path: str | Path | None) -> Config:
@@ -219,7 +237,7 @@ def load_config(path: str | Path | None) -> Config:
         "exclude_translate_tags", "only_files", "exclude_files",
         "test_enabled", "test_num", "retranslate_file", "retranslate_start",
         "retranslate_end", "glossary_path", "ebook_convert_path",
-        "max_error_count", "skip_failed", "log_file",
+        "max_error_count", "skip_failed", "log_file", "glossary",
     ):
         if top_key in raw:
             setattr(cfg, top_key, raw[top_key])
@@ -241,14 +259,14 @@ def load_config(path: str | Path | None) -> Config:
 
     if cfg.glossary_path:
         cfg.glossary_path = os.path.expanduser(cfg.glossary_path)
-    if cfg.ebook_convert_path and os.sep in cfg.ebook_convert_path:
+    if cfg.ebook_convert_path:
         cfg.ebook_convert_path = os.path.expanduser(cfg.ebook_convert_path)
     if cfg.log_file:
         cfg.log_file = os.path.expanduser(cfg.log_file)
 
-    if cfg.translation_position not in {"below", "above", "only"}:
+    if cfg.translation_position not in {"below", "above", "left", "right", "only"}:
         raise ValueError(
-            "translation_position 必须是 below、above 或 only"
+            "translation_position 必须是 below、above、left、right 或 only"
         )
 
     return cfg

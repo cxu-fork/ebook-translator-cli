@@ -8,7 +8,8 @@ from types import SimpleNamespace
 from lxml import etree
 
 from ebook_translator.epub import (
-    _extract_text, _resolve_href, extract_from_epub, write_translated_epub,
+    ExtractedElement, _extract_text, _resolve_href, build_cache_rows,
+    extract_from_epub, write_translated_epub,
     _inject_translation, _is_non_translatable, _localname, _parse_content_page,
     _validate_archive,
 )
@@ -64,6 +65,65 @@ class EpubTests(unittest.TestCase):
         with zipfile.ZipFile(out) as zf:
             data = zf.read("book.html")
         self.assertEqual(2, data.count(b"et-translation"))
+
+    def test_doctype_entities_and_mimetype_header_remain_valid(self):
+        epub = self.tmp / "doctype.epub"
+        body = (
+            '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+            '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            "<p>Hello&nbsp;world</p></body></html>"
+        )
+        make_epub(epub, body)
+        elements, _ = extract_from_epub(str(epub))
+        out = self.tmp / "doctype-out.epub"
+        write_translated_epub(
+            str(epub), str(out), {elements[0].uid: "你好 世界"}, expected_count=1)
+
+        with zipfile.ZipFile(out) as zf:
+            page = zf.read("c.xhtml")
+        self.assertIn(b"<!DOCTYPE html", page)
+        etree.fromstring(page, parser=etree.XMLParser(
+            resolve_entities=False, load_dtd=False, no_network=True))
+        raw = out.read_bytes()
+        self.assertEqual(b"PK\x03\x04", raw[:4])
+        self.assertEqual(0, int.from_bytes(raw[28:30], "little"))
+        self.assertEqual(b"application/epub+zip", raw[38:58])
+
+    def test_letter_e_is_not_treated_as_a_number(self):
+        self.assertFalse(_is_non_translatable("E"))
+        self.assertTrue(_is_non_translatable("-3.14e2"))
+
+    def test_cache_fingerprint_separates_index_from_text(self):
+        elements = [
+            ExtractedElement(str(i), "", "2X" if i == 1 else "X" if i == 12 else f"p{i}")
+            for i in range(13)
+        ]
+        rows = build_cache_rows(elements)
+        self.assertNotEqual(rows[1][1], rows[12][1])
+
+    def test_equivalent_spine_hrefs_are_processed_once(self):
+        epub = self.tmp / "duplicate-spine.epub"
+        with zipfile.ZipFile(epub, "w") as zf:
+            zf.writestr("mimetype", "application/epub+zip")
+            zf.writestr(
+                "META-INF/container.xml",
+                "<container><rootfiles><rootfile full-path='content.opf'/></rootfiles></container>",
+            )
+            zf.writestr(
+                "content.opf",
+                "<package><metadata/><manifest>"
+                "<item id='a' href='c.xhtml' media-type='application/xhtml+xml'/>"
+                "<item id='b' href='./c.xhtml' media-type='application/xhtml+xml'/>"
+                "</manifest><spine><itemref idref='a'/><itemref idref='b'/></spine></package>",
+            )
+            zf.writestr("c.xhtml", "<html><body><p>Hello</p></body></html>")
+        elements, _ = extract_from_epub(str(epub))
+        self.assertEqual(1, len(elements))
+        out = self.tmp / "duplicate-spine-out.epub"
+        self.assertEqual(1, write_translated_epub(
+            str(epub), str(out), {elements[0].uid: "你好"}, expected_count=1,
+        ))
 
     def test_nested_blocks_are_separate_translation_units(self):
         epub = self.tmp / "nested.epub"
@@ -320,6 +380,17 @@ class EpubTests(unittest.TestCase):
         self.assertEqual("你好", _extract_text(paragraph))
         self.assertEqual(0, len(paragraph))
         self.assertIn("color: red", paragraph.get("style"))
+
+    def test_left_position_builds_two_xml_columns(self):
+        root = etree.fromstring("<body><p id='anchor'>Hello</p></body>")
+        _inject_translation(root[0], "你好", "left")
+
+        table = root[0]
+        self.assertEqual("table", _localname(table.tag))
+        cells = table.findall(".//td")
+        self.assertEqual(2, len(cells))
+        self.assertEqual("你好", _extract_text(cells[0]))
+        self.assertEqual("Hello", _extract_text(cells[1]))
 
     def test_write_with_style_attribute(self):
         epub = self.tmp / "style.epub"

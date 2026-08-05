@@ -1,3 +1,4 @@
+use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -220,6 +221,7 @@ async fn run_inner(args: Args) -> Result<i32> {
     let start = Instant::now();
     let mut succeeded = 0;
     let mut failed = 0;
+    let mut produced_outputs = Vec::new();
     for book in books {
         let stem = book.file_stem().and_then(|x| x.to_str()).unwrap_or("book");
         let result = tokio::select! {
@@ -230,7 +232,15 @@ async fn run_inner(args: Args) -> Result<i32> {
                 &config,
                 &glossary,
                 &args,
+                (&progress, &mut produced_outputs),
             ) => result,
+            _ = tokio::time::sleep(Duration::from_secs(14400)) => {
+                progress.println(format!("  处理超时（3600 秒），跳过: {stem}"));
+                log("ERROR", &format!("处理超时: {}", book.display()));
+                failed += 1;
+                progress.inc(1);
+                continue;
+            }
             _ = tokio::signal::ctrl_c() => {
                 progress.finish_and_clear();
                 eprintln!("翻译被中断，进度已保存");
@@ -308,6 +318,16 @@ fn apply_overrides(args: &Args, config: &mut Config) -> Result<()> {
     if let Some(value) = &args.retranslate_end {
         config.retranslate_end.clone_from(value);
     }
+    let retranslate_values = [
+        config.retranslate_file.trim(),
+        config.retranslate_start.trim(),
+        config.retranslate_end.trim(),
+    ];
+    if retranslate_values.iter().any(|value| !value.is_empty())
+        && (retranslate_values[0].is_empty() || retranslate_values[1].is_empty())
+    {
+        bail!("重翻译必须同时设置 retranslate_file 和 retranslate_start");
+    }
     if args.translate_metadata {
         config.metadata_translation = true;
     }
@@ -332,19 +352,21 @@ async fn translate_book(
     config: &Config,
     glossary: &Glossary,
     args: &Args,
+    state: (&ProgressBar, &mut Vec<PathBuf>),
 ) -> Result<bool> {
+    let (progress, produced_outputs) = state;
     let input_format = extension(input);
     if !SUPPORTED.contains(&input_format.as_str()) {
         return Ok(false);
     }
     log("INFO", &format!("开始处理: {}", input.display()));
-    let converted = convert_to_epub(
-        input,
-        &config.ebook_convert_path,
-        (!config.input_encoding.is_empty()).then_some(config.input_encoding.as_str()),
-    )
-    .context("格式转换失败")?;
-    let (elements, meta) = extract_from_epub(&converted.path, config).context("EPUB 解析失败")?;
+    let convert_input = input.to_owned();
+    let converter = config.ebook_convert_path.clone();
+    let encoding = (!config.input_encoding.is_empty()).then(|| config.input_encoding.clone());
+    let converted = convert_to_epub(&convert_input, &converter, encoding.as_deref()).context("格式转换失败")?;
+    let epub_path = converted.path.clone();
+    let extraction_config = config.clone();
+    let (elements, meta) = extract_from_epub(&epub_path, &extraction_config).context("EPUB 解析失败")?;
     if elements.is_empty() {
         eprintln!("  未找到可翻译内容: {}", input.display());
         return Ok(false);
@@ -357,6 +379,33 @@ async fn translate_book(
             .into_owned()
     } else {
         meta.title.clone()
+    };
+    let early_output = if args.review_export.is_none()
+        && (!config.custom_title.trim().is_empty()
+            || (!config.translate_title && !config.metadata_translation))
+    {
+        let output_dir = output_dir.ok_or_else(|| anyhow!("缺少输出目录"))?;
+        let output_title = if config.custom_title.trim().is_empty()
+            && !config.translate_title
+            && !config.metadata_translation
+        {
+            input
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&original_title)
+                .to_owned()
+        } else {
+            select_title(config, &original_title, None)
+        };
+        let output = output_dir.join(output_filename(&output_title, output_format));
+        validate_output_target(input, &output, produced_outputs)?;
+        if output.exists() && !args.force {
+            progress.println(format!("  输出已存在，跳过: {}", output.display()));
+            return Ok(true);
+        }
+        Some(output)
+    } else {
+        None
     };
     let cache_key = cache_key(input, &elements, config, glossary)?;
     let cache_path = config
@@ -411,8 +460,27 @@ async fn translate_book(
             &config.source_lang,
             &config.target_lang,
         )?;
-        let worker =
+        let mut worker =
             TranslationWorker::new(engine, cache.clone(), config.clone(), glossary.clone());
+        let mut fallback_names = vec!["deeplx", "deepx"];
+        fallback_names.retain(|name| *name != config.engine);
+        for name in fallback_names {
+            let Some(fallback_config) = config.engines.get(name) else {
+                continue;
+            };
+            match Engine::new(
+                name,
+                fallback_config.clone(),
+                &config.source_lang,
+                &config.target_lang,
+            ) {
+                Ok(fallback) => {
+                    eprintln!("  已启用 {name} 兜底渠道");
+                    worker = worker.with_fallback(fallback);
+                }
+                Err(error) => eprintln!("  {name} 兜底不可用: {error:#}"),
+            }
+        }
         let (done, failed) = worker.translate_batch(untranslated).await;
         eprintln!("  {original_title}: {total} 段, 完成 {done}, 缓存 {already}, 失败 {failed}");
         if failed > 0 && !config.skip_failed {
@@ -436,48 +504,65 @@ async fn translate_book(
         .filter(|value| !value.is_empty());
     let final_title = select_title(config, &original_title, translated_title);
     let output_dir = output_dir.ok_or_else(|| anyhow!("缺少输出目录"))?;
-    let output = output_dir.join(output_filename(&final_title, output_format));
-    if canonical_target(input)? == canonical_target(&output)? {
-        bail!("拒绝覆盖输入文件: {}", input.display());
-    }
+    let output = early_output
+        .unwrap_or_else(|| output_dir.join(output_filename(&final_title, output_format)));
+    validate_output_target(input, &output, produced_outputs)?;
     if output.exists() && !args.force {
-        bail!(
-            "输出文件已存在: {}（使用 --force 原子覆盖）",
-            output.display()
-        );
+        progress.println(format!("  输出已存在，跳过: {}", output.display()));
+        return Ok(true);
     }
-    let translated = Builder::new()
+    let translated_path = Builder::new()
         .prefix(".et-translated-")
         .suffix(".epub")
-        .tempfile_in(output_dir)?;
-    let translated_path = translated.path().to_owned();
-    drop(translated);
-    write_translated_epub(
-        &converted.path,
-        &translated_path,
-        &translations,
-        config,
-        translations.len(),
-        &final_title,
-    )?;
+        .tempfile_in(output_dir)?
+        .into_temp_path();
+    let write_input = converted.path.clone();
+    let write_output = translated_path.to_path_buf();
+    let write_config = config.clone();
+    let write_title = final_title.clone();
+    let expected_count = translations.len();
+    tokio::task::spawn_blocking(move || {
+        write_translated_epub(
+            &write_input,
+            &write_output,
+            &translations,
+            &write_config,
+            expected_count,
+            &write_title,
+        )
+    })
+    .await
+    .context("EPUB 写出任务异常结束")??;
     if output_format == "epub" {
         replace(&translated_path, &output)?;
-    } else if let Err(error) = convert(
-        &translated_path,
-        &output,
-        output_format,
-        &config.ebook_convert_path,
-        None,
-    ) {
+        produced_outputs.push(output.clone());
+    } else if let Err(error) = {
+        let convert_input = translated_path.to_path_buf();
+        let convert_output = output.clone();
+        let output_format = output_format.to_owned();
+        let converter = config.ebook_convert_path.clone();
+        tokio::task::spawn_blocking(move || {
+            convert(
+                &convert_input,
+                &convert_output,
+                &output_format,
+                &converter,
+                None,
+            )
+        })
+        .await
+        .context("输出转换任务异常结束")?
+    } {
         let fallback = fallback_epub(&output, input);
         replace(&translated_path, &fallback)?;
+        produced_outputs.push(fallback.clone());
         eprintln!(
             "输出转换失败({error:#})，已回退保存为 EPUB: {}",
             fallback.display()
         );
         return Ok(false);
     } else {
-        let _ = fs::remove_file(&translated_path);
+        produced_outputs.push(output.clone());
     }
     log(
         "INFO",
@@ -615,6 +700,9 @@ fn import_review(
             && paragraph.action == "keep"
             && !paragraph.ignored
         {
+            if translation.trim().is_empty() {
+                bail!("校审 keep 译文不能为空: {}", paragraph.id);
+            }
             validate_markup_tokens(&paragraph.original, translation)
                 .with_context(|| format!("校审译文占位符无效: {}", paragraph.id))?;
         }
@@ -657,7 +745,11 @@ fn output_filename(title: &str, extension: &str) -> String {
             }
         })
         .collect::<String>();
-    name = name.trim().trim_end_matches(['.', ' ']).to_owned();
+    name = name
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches(['.', ' '])
+        .to_owned();
     if name.is_empty() {
         name = "book".into();
     }
@@ -689,8 +781,10 @@ fn output_filename(title: &str, extension: &str) -> String {
     ) {
         name.insert(0, '_');
     }
-    let maximum = 200usize.saturating_sub(extension.chars().count() + 1);
-    name = name.chars().take(maximum.max(1)).collect();
+    let maximum = 200usize.saturating_sub(extension.len() + 1).max(1);
+    while name.len() > maximum {
+        name.pop();
+    }
     format!("{name}.{extension}")
 }
 
@@ -800,7 +894,12 @@ fn collect_books(input: &Path) -> Result<Vec<PathBuf>> {
     }
     let mut books = fs::read_dir(input)?
         .filter_map(|x| x.ok().map(|x| x.path()))
-        .filter(|x| x.is_file() && SUPPORTED.contains(&extension(x).as_str()))
+        .filter(|x| {
+            x.is_file()
+                && x.file_name()
+                    .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+                && SUPPORTED.contains(&extension(x).as_str())
+        })
         .collect::<Vec<_>>();
     books.sort();
     Ok(books)
@@ -824,6 +923,42 @@ fn canonical_target(path: &Path) -> Result<PathBuf> {
     Ok(normalize(
         &parent.join(path.file_name().unwrap_or_default()),
     ))
+}
+
+fn validate_output_target(input: &Path, output: &Path, produced: &[PathBuf]) -> Result<()> {
+    if same_file(input, output)? {
+        bail!("拒绝覆盖输入文件: {}", input.display());
+    }
+    if produced
+        .iter()
+        .any(|previous| same_file(previous, output).unwrap_or(previous == output))
+    {
+        bail!("批量输出文件名冲突: {}", output.display());
+    }
+    Ok(())
+}
+
+fn same_file(left: &Path, right: &Path) -> Result<bool> {
+    let (Ok(left_meta), Ok(right_meta)) = (fs::metadata(left), fs::metadata(right)) else {
+        return Ok(canonical_target(left)? == canonical_target(right)?);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(
+            left_meta.volume_serial_number() == right_meta.volume_serial_number()
+                && left_meta.file_index() == right_meta.file_index(),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(canonical_target(left)? == canonical_target(right)?)
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -915,6 +1050,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("b.epub"), b"").unwrap();
         fs::write(dir.path().join("a.MOBI"), b"").unwrap();
+        fs::write(dir.path().join("._hidden.epub"), b"").unwrap();
         fs::write(dir.path().join("x.exe"), b"").unwrap();
         assert_eq!(
             collect_books(dir.path())
@@ -982,6 +1118,9 @@ mod tests {
         fs::write(&review, serde_json::to_vec(&document).unwrap()).unwrap();
         import_review(&review, &source, &elements, &cache, "openai", "Chinese").unwrap();
         assert_eq!(cache.all().unwrap()[0].translation.as_deref(), Some("译文"));
+        document.paragraphs[0].translation = Some(String::new());
+        fs::write(&review, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(import_review(&review, &source, &elements, &cache, "openai", "Chinese").is_err());
         document.paragraphs[0].translation = None;
         document.paragraphs[0].action = "retranslate".into();
         fs::write(&review, serde_json::to_vec(&document).unwrap()).unwrap();
@@ -993,6 +1132,11 @@ mod tests {
         assert!(import_review(&review, &source, &elements, &cache, "openai", "Chinese").is_err());
         assert_eq!(output_filename("CON", "epub"), "_CON.epub");
         assert_eq!(output_filename("a/b:*?", "epub"), "a_b___.epub");
+        assert_eq!(output_filename("...Title", "epub"), "Title.epub");
+        assert!(output_filename(&"书".repeat(200), "epub").len() <= 200);
+        let alias = dir.path().join("alias.epub");
+        fs::hard_link(&source, &alias).unwrap();
+        assert!(same_file(&source, &alias).unwrap());
         assert_eq!(
             select_title(
                 &Config {
@@ -1073,6 +1217,8 @@ mod tests {
             review.to_str().unwrap(),
         ])
         .unwrap();
+        let progress = ProgressBar::hidden();
+        let mut produced = Vec::new();
         assert!(
             translate_book(
                 &input,
@@ -1084,6 +1230,7 @@ mod tests {
                 },
                 &Glossary::default(),
                 &review_args,
+                (&progress, &mut produced),
             )
             .await
             .unwrap()
@@ -1158,6 +1305,7 @@ mod tests {
                 &config,
                 &Glossary::default(),
                 &args,
+                (&progress, &mut produced),
             )
             .await
             .unwrap()

@@ -8,6 +8,7 @@ This module handles:
   - Writing the translated EPUB back out
 """
 import os
+import logging
 import posixpath
 import re
 import shutil
@@ -114,7 +115,7 @@ def _parse_opf(zf: zipfile.ZipFile, opf_path: str):
 def _resolve_href(base: str, href: str) -> str:
     base_dir = posixpath.dirname(base.replace("\\", "/"))
     href = unquote(urlsplit(href).path).replace("\\", "/")
-    resolved = posixpath.normpath(posixpath.join(base_dir, href)) if base_dir else href
+    resolved = posixpath.normpath(posixpath.join(base_dir, href))
     return "" if resolved == "." else resolved
 
 
@@ -198,7 +199,7 @@ def _is_non_translatable(text: str) -> bool:
     if _RE_ISBN.fullmatch(stripped):
         return True
     # Pure number (including formatted: 1,234.56, -3.14e2, 99%)
-    if re.fullmatch(r"[\d,.\-+eE\s%]+", stripped):
+    if re.search(r"\d", stripped) and re.fullmatch(r"[\d,.\-+eE\s%]+", stripped):
         return True
     if _RE_FIGURE.fullmatch(stripped):
         return True
@@ -308,6 +309,14 @@ def extract_from_epub(epub_path: str,
                     meta["title"] = child.text.strip()
                     break
 
+        unique_spine: list[str] = []
+        seen_members: set[str] = set()
+        for href in spine_hrefs:
+            resolved = _resolve_href(opf_path, href)
+            if resolved not in seen_members:
+                seen_members.add(resolved)
+                unique_spine.append(href)
+        spine_hrefs = unique_spine
         meta["spine_hrefs"] = spine_hrefs
 
         _only = _parse_tag_set(only_files)
@@ -353,7 +362,7 @@ def build_cache_rows(elements: list[ExtractedElement]) -> list[tuple]:
     rows = []
     for i, el in enumerate(elements):
         rows.append((
-            el.uid, _md5(f"{i}{el.original}"), el.raw_html, el.original,
+            el.uid, _md5(f"{i}\0{el.original}"), el.raw_html, el.original,
             el.ignored, None, el.page_href,
         ))
     return rows
@@ -394,6 +403,22 @@ def _inject_translation(el: etree._Element, translation: str,
         return
 
     frag = _make_translation_fragment(el, translation, style=style)
+    if position in {"left", "right"}:
+        parent = el.getparent()
+        if parent is None:
+            return
+        namespaced = isinstance(el.tag, str) and el.tag.startswith("{")
+        tag = lambda name: f"{{{NS_XHTML}}}{name}" if namespaced else name
+        table = etree.Element(tag("table"), {"class": "et-translation-table", "width": "100%"})
+        row = etree.SubElement(etree.SubElement(table, tag("tbody")), tag("tr"))
+        left = etree.SubElement(row, tag("td"), {"width": "50%", "valign": "top"})
+        right = etree.SubElement(row, tag("td"), {"width": "50%", "valign": "top"})
+        table.tail, el.tail = el.tail, None
+        parent.replace(el, table)
+        original_cell, translated_cell = (right, left) if position == "left" else (left, right)
+        original_cell.append(el)
+        translated_cell.append(frag)
+        return
     if position == "above":
         frag.tail = el.text
         el.text = None
@@ -468,7 +493,9 @@ def write_translated_epub(
             _validate_archive(zin)
             opf_path = _read_container(zin)
             _manifest, spine_hrefs, _ = _parse_opf(zin, opf_path)
-            resolved_map = {_resolve_href(opf_path, h): h for h in spine_hrefs}
+            resolved_map: dict[str, str] = {}
+            for href in spine_hrefs:
+                resolved_map.setdefault(_resolve_href(opf_path, href), href)
 
             with zipfile.ZipFile(tmp_output, "w") as zout:
                 for item in zin.infolist():
@@ -482,9 +509,7 @@ def write_translated_epub(
                         injected_total += injected
                         zout.writestr(item, data)
                     else:
-                        with zin.open(item) as source, zout.open(
-                            item, "w", force_zip64=True
-                        ) as target:
+                        with zin.open(item) as source, zout.open(item, "w") as target:
                             shutil.copyfileobj(source, target, 1024 * 1024)
         if expected_count is None:
             expected_count = len(translations)
@@ -518,8 +543,15 @@ def _inject_into_page(data: bytes, page_href: str,
                                  translate_tags=translate_tags,
                                  exclude_tags=exclude_tags,
                                  style=style)
+    if injected == 0:
+        return data, 0
+    doctype = tree.getroottree().docinfo.doctype or None
     if recovered:
-        output = etree.tostring(tree, encoding="utf-8", method="html")
-    else:
-        output = etree.tostring(tree, encoding="utf-8", xml_declaration=True)
+        logging.warning("XHTML 使用 HTML 恢复解析后以 XML 写回: %s", page_href)
+        if _localname(tree.tag) == "html" and not tree.get("xmlns"):
+            tree.set("xmlns", NS_XHTML)
+    output = etree.tostring(
+        tree.getroottree(), encoding="utf-8", xml_declaration=True,
+        method="xml", doctype=doctype,
+    )
     return output, injected

@@ -44,7 +44,7 @@
     "skip_failed": false,
     "engines": {
         "openai": {
-            "api_key": "sk-你的密钥",
+            "api_key": "你的密钥",
             "base_url": "https://api.openai.com/v1",
             "model": "gpt-4o-mini",
             "temperature": 0.3,
@@ -59,7 +59,7 @@
             "stream": false
         },
         "deepseek": {
-            "api_key": "sk-你的密钥",
+            "api_key": "你的密钥",
             "base_url": "https://api.deepseek.com/v1",
             "model": "deepseek-chat",
             "temperature": 0.3,
@@ -68,7 +68,7 @@
             "request_interval": 0.5
         },
         "claude": {
-            "api_key": "sk-ant-你的密钥",
+            "api_key": "你的密钥",
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 4096,
             "temperature": 0.3,

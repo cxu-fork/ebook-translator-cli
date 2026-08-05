@@ -171,11 +171,12 @@ def _ebook_convert(input_path: str, output_path: str, output_format: str,
     os.close(fd)
     os.remove(tmp_output)
     cmd = [binary, input_path, tmp_output]
-    if output_format in ("epub", "mobi", "azw3"):
-        cmd.extend(["--enable-heuristics"])
     try:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=300,
+            )
         except subprocess.TimeoutExpired:
             raise ConverterError(f"ebook-convert 超时 (300秒): {input_path}")
         except OSError as e:

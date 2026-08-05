@@ -107,6 +107,20 @@ class ConfigEngineTests(unittest.TestCase):
         self.assertEqual("https://api.deepseek.com/v1/chat/completions", engine.chat_url)
         self.assertEqual("deepseek-chat", engine.model)
 
+        without_v1 = engine_cls(
+            EngineConfig(api_key="x", base_url="https://api.deepseek.com"),
+            "English", "Chinese",
+        )
+        self.assertEqual("deepseek-chat", without_v1.model)
+
+    def test_example_config_keys_are_consumed_not_sent_to_api(self):
+        cfg = load_config(Path(__file__).parents[1] / "config.example.json")
+        engine = cfg.engines["openai"]
+        self.assertEqual("temperature", engine.sampling)
+        self.assertIsNone(engine.prompt)
+        self.assertNotIn("sampling", engine.extra)
+        self.assertNotIn("prompt", engine.extra)
+
     def test_anthropic_extra_supports_max_tokens_and_rejects_reserved_fields(self):
         engine = AnthropicEngine(EngineConfig(
             api_key="x", extra={"max_tokens": 123, "metadata": {"user_id": "u"}},
@@ -120,6 +134,24 @@ class ConfigEngineTests(unittest.TestCase):
         ), "English", "Chinese")
         with self.assertRaises(ValueError):
             bad._body("hi", "prompt", stream=False)
+
+        default_body = AnthropicEngine(
+            EngineConfig(api_key="x"), "English", "Chinese"
+        )._body("hi", "prompt", stream=False)
+        self.assertEqual(64_000, default_body["max_tokens"])
+        self.assertIn("temperature", default_body)
+        self.assertNotIn("top_p", default_body)
+
+        top_p_body = AnthropicEngine(
+            EngineConfig(api_key="x", sampling="top_p"), "English", "Chinese"
+        )._body("hi", "prompt", stream=False)
+        self.assertNotIn("temperature", top_p_body)
+        self.assertIn("top_p", top_p_body)
+
+    def test_auto_source_language_uses_detected_language(self):
+        engine = OpenAIEngine(EngineConfig(api_key="x"), "Auto", "Chinese")
+        prompt = engine.build_prompt("Translate from <slang> to <tlang>")
+        self.assertEqual("Translate from detected language to Chinese", prompt)
 
     def test_engines_reject_truncated_responses(self):
         openai = OpenAIEngine(EngineConfig(api_key="x"), "English", "Chinese")
@@ -268,7 +300,8 @@ class ConfigEngineTests(unittest.TestCase):
             {"engines": {"openai": {"retry_delay": float("nan")}}},
             {"engines": {"openai": {"top_p": 1.1}}},
             {"engines": {"openai": {"request_timeout": None}}},
-            {"engines": {"openai": {"concurrency": 33}}},
+            {"engines": {"openai": {"concurrency": 257}}},
+            {"engines": {"openai": {"temprature": 0.2}}},
             {"engines": {"claude": {"temperature": 1.1}}},
         ]
         for i, value in enumerate(cases):

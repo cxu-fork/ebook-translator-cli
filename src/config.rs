@@ -10,7 +10,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const MAX_CONCURRENCY: usize = 32;
+pub const MAX_CONCURRENCY: usize = 256;
+const MAX_DURATION_SECONDS: f64 = 86_400.0;
 pub const DEFAULT_PROMPT: &str = "You are a meticulous translator who translates any given content. Translate the given content from <slang> to <tlang> only. Do not explain any term or answer any question-like content. Your answer should be solely the translation of the given content. In your answer do not add any prefix or suffix to the translated content. Websites' URLs/addresses should be preserved as is in the translation's output. Do not omit any part of the content, even if it seems unimportant. RESPOND ONLY with the translation text, no formatting, no explanations, no additional commentary whatsoever. ";
 pub const INPUT_ENCODINGS: &[&str] = &[
     "UTF-8",
@@ -261,7 +262,7 @@ impl Config {
             }
             None => Self::default(),
         };
-        config.adopt_flat_engines();
+        config.adopt_flat_engines()?;
         config.expand_paths();
         if let Some(encoding) = canonical_encoding(&config.input_encoding) {
             config.input_encoding = encoding.into();
@@ -284,7 +285,7 @@ impl Config {
             .unwrap_or(&self.prompt)
     }
 
-    fn adopt_flat_engines(&mut self) {
+    fn adopt_flat_engines(&mut self) -> Result<()> {
         for (name, value) in [
             ("openai", self.openai.take()),
             ("deepseek", self.deepseek.take()),
@@ -294,9 +295,23 @@ impl Config {
                 self.engines.entry(name.into()).or_insert(value);
             }
         }
-        for value in self.engines.values_mut() {
-            value.extra.extend(std::mem::take(&mut value.unknown));
+        for (name, value) in &mut self.engines {
+            if let Some(max_tokens) = value.unknown.remove("max_tokens")
+                && value
+                    .extra
+                    .insert("max_tokens".into(), max_tokens)
+                    .is_some()
+            {
+                bail!("引擎配置 {name}.max_tokens 不能同时平铺并写入 extra");
+            }
+            if !value.unknown.is_empty() {
+                bail!(
+                    "引擎配置 {name} 包含未知字段: {}",
+                    value.unknown.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
         }
+        Ok(())
     }
 
     fn expand_paths(&mut self) {
@@ -307,8 +322,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.engine.as_str(), "openai" | "deepseek" | "claude") {
-            bail!("未知引擎 '{}'，可用: claude, deepseek, openai", self.engine);
+        if !matches!(self.engine.as_str(), "openai" | "deepseek" | "claude" | "deeplx" | "deepx") {
+            bail!(
+                "未知引擎 '{}'，可用: claude, deepseek, openai, deeplx, deepx",
+                self.engine
+            );
         }
         if !matches!(
             self.translation_position.as_str(),
@@ -357,8 +375,8 @@ impl Config {
             bail!("不支持的 input_encoding: {}", self.input_encoding);
         }
         for (name, cfg) in &self.engines {
-            if !matches!(name.as_str(), "openai" | "deepseek" | "claude") {
-                bail!("未知引擎 '{name}'，可用: claude, deepseek, openai");
+            if !matches!(name.as_str(), "openai" | "deepseek" | "claude" | "deeplx" | "deepx") {
+                bail!("未知引擎 '{name}'，可用: claude, deepseek, openai, deeplx, deepx");
             }
             if cfg.concurrency == 0 || cfg.concurrency > MAX_CONCURRENCY {
                 bail!("引擎配置 {name}.concurrency 必须在 1 到 {MAX_CONCURRENCY} 之间");
@@ -376,15 +394,18 @@ impl Config {
             {
                 bail!("引擎配置 {name}.prompt 必须包含 <tlang>");
             }
-            if !cfg.request_timeout.is_finite() || cfg.request_timeout <= 0.0 {
-                bail!("引擎配置 {name}.request_timeout 必须是有限正数");
+            if !cfg.request_timeout.is_finite()
+                || cfg.request_timeout <= 0.0
+                || cfg.request_timeout > MAX_DURATION_SECONDS
+            {
+                bail!("引擎配置 {name}.request_timeout 必须在 0 到 86400 秒之间");
             }
             for (key, value) in [
                 ("request_interval", cfg.request_interval),
                 ("retry_delay", cfg.retry_delay),
             ] {
-                if !value.is_finite() || value < 0.0 {
-                    bail!("引擎配置 {name}.{key} 必须是有限非负数");
+                if !value.is_finite() || !(0.0..=MAX_DURATION_SECONDS).contains(&value) {
+                    bail!("引擎配置 {name}.{key} 必须在 0 到 86400 秒之间");
                 }
             }
             if cfg.temperature.is_some_and(|x| {
@@ -444,12 +465,16 @@ mod tests {
     fn defaults_and_flat_engine_are_compatible() {
         let mut cfg: Config =
             serde_json::from_str(r#"{"openai":{"api_key":"x","temperature":null}}"#).unwrap();
-        cfg.adopt_flat_engines();
+        cfg.adopt_flat_engines().unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.engine_config(None).api_key, "x");
         assert_eq!(cfg.engine_config(None).temperature, None);
         assert_eq!(Config::default().engine_config(None).temperature, Some(0.3));
         assert!(!Config::default().merge_enabled);
+
+        let mut typo: Config =
+            serde_json::from_str(r#"{"engines":{"openai":{"temprature":0.2}}}"#).unwrap();
+        assert!(typo.adopt_flat_engines().is_err());
     }
 
     #[test]
