@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <wchar.h>
@@ -89,29 +90,33 @@ int et_mobi_to_epub(const char *input, const char *output, char *error, size_t e
 }
 
 #ifdef _WIN32
-static mz_bool mz_zip_writer_init_wfile(mz_zip_archive *zip, const wchar_t *filename) {
-    zip->m_pWrite = mz_zip_file_write_func;
-    zip->m_pIO_opaque = zip;
-    if (!mz_zip_writer_init(zip, 0)) return MZ_FALSE;
-    zip->m_pState->m_pFile = _wfopen(filename, L"wb");
-    if (!zip->m_pState->m_pFile) {
-        mz_zip_writer_end(zip);
-        return MZ_FALSE;
+#include <windows.h>
+
+/* Convert a wide-character string to a heap-allocated UTF-8 string.
+   Returns NULL on failure.  Caller must free() the result. */
+static char *et_wide_to_utf8(const wchar_t *wide) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return NULL;
+    char *buf = (char *)malloc((size_t)len);
+    if (!buf) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, buf, len, NULL, NULL) == 0) {
+        free(buf);
+        return NULL;
     }
-    return MZ_TRUE;
+    return buf;
 }
 
 int et_mobi_to_epub_w(const wchar_t *input, const wchar_t *output, char *error, size_t error_size) {
-    mz_zip_archive zip;
-    memset(&zip, 0, sizeof(zip));
-    FILE *file = _wfopen(input, L"rb");
-    if (!file) return fail(error, error_size, "libmobi: cannot open input");
-    if (!mz_zip_writer_init_wfile(&zip, output)) {
-        fclose(file);
-        return fail(error, error_size, "libmobi: cannot create EPUB");
+    char *input_u8 = et_wide_to_utf8(input);
+    char *output_u8 = et_wide_to_utf8(output);
+    if (!input_u8 || !output_u8) {
+        free(input_u8);
+        free(output_u8);
+        return fail(error, error_size, "libmobi: path conversion failed");
     }
-    int result = convert_open(file, &zip, error, error_size);
-    if (result) _wremove(output);
+    int result = et_mobi_to_epub(input_u8, output_u8, error, error_size);
+    free(input_u8);
+    free(output_u8);
     return result;
 }
 #endif

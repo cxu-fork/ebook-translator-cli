@@ -938,6 +938,7 @@ fn validate_output_target(input: &Path, output: &Path, produced: &[PathBuf]) -> 
     Ok(())
 }
 
+#[cfg_attr(windows, allow(unused_variables))]
 fn same_file(left: &Path, right: &Path) -> Result<bool> {
     let (Ok(left_meta), Ok(right_meta)) = (fs::metadata(left), fs::metadata(right)) else {
         return Ok(canonical_target(left)? == canonical_target(right)?);
@@ -949,11 +950,7 @@ fn same_file(left: &Path, right: &Path) -> Result<bool> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        Ok(
-            left_meta.volume_serial_number() == right_meta.volume_serial_number()
-                && left_meta.file_index() == right_meta.file_index(),
-        )
+        Ok(canonical_target(left)? == canonical_target(right)?)
     }
     #[cfg(not(any(unix, windows)))]
     {
