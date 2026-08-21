@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - ".github/workflows/build-linux.yml"
+  pull_request:
 
 permissions:
   contents: read
