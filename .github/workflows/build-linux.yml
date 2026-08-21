@@ -22,10 +22,21 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - arch: armhf
+            runner: ubuntu-24.04
+            target: armv7-unknown-linux-gnueabihf
+            cross: true
     runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install armhf cross compiler
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          echo 'export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc' >> $GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
         with:
